@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+"""
+Product sync: check all Viator products across all sites for availability.
+Usage: python3 product_sync.py [--quiet|-q] [all|site_id]
+  --quiet, -q  suppress per-product OK lines (only show warnings/errors + summary)
+Runs sequentially across sites with 1 sec delay between Viator API calls.
+Output: summary with disappeared products flagged for urgent attention.
+"""
+import sqlite3, os, sys, json, time, urllib.request, re
+from datetime import datetime
+
+DB_DIR = os.path.expanduser("~/.hermes/affiliate-crons/db")
+
+def get_viator_key():
+    """Load Viator API key from environment or .env file."""
+    key = os.environ.get("VIATOR_API_KEY", "")
+    if not key:
+        env_path = os.path.expanduser("~/.hermes/.env")
+        if os.path.exists(env_path):
+            with open(env_path) as f:
+                for line in f:
+                    if line.startswith("VIATOR_API_KEY="):
+                        key = line.split("=", 1)[1].strip().strip('"').strip("'")
+                        break
+    return key
+
+def get_sites(target="all"):
+    reg = sqlite3.connect(os.path.join(DB_DIR, "site_registry.db"))
+    if target == "all":
+        sites = reg.execute(
+            "SELECT site_id, local_path FROM sites WHERE status='active'").fetchall()
+    else:
+        sites = reg.execute(
+            "SELECT site_id, local_path FROM sites WHERE site_id=? AND status='active'",
+            (target,)).fetchall()
+    reg.close()
+    return sites
+
+def get_products(site_id):
+    reg = sqlite3.connect(os.path.join(DB_DIR, "site_registry.db"))
+    prods = reg.execute(
+        "SELECT DISTINCT product_code FROM site_products WHERE site_id=?",
+        (site_id,)).fetchall()
+    reg.close()
+    return [p[0] for p in prods]
+
+def check_product(api_key, code):
+    """Check product availability via Viator API.
+
+    Strips d{DESTID}- prefix if present (legacy data from old regex).
+    """
+    # Strip legacy dXXXXX- prefix if stored from old buggy regex
+    bare_code = re.sub(r'^d\d+-', '', code)
+    url = f"https://api.viator.com/partner/products/{bare_code}"
+    headers = {"exp-api-key": api_key, "Accept-Language": "en-US", "Content-Type": "application/json", "Accept": "application/json;version=2.0"}
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        resp = urllib.request.urlopen(req, timeout=10)
+        data = json.loads(resp.read())
+        available = "productCode" in data
+        price = None
+        title = data.get("title", "Unknown")
+        if available and "pricing" in data:
+            summary = data["pricing"].get("summary")
+            if summary:
+                price = summary.get("fromPrice")
+        return available, price, title
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return False, None, "Not Found"
+        if e.code == 403:
+            return None, None, "API access denied"
+        if e.code == 429:
+            print("  [WARN] Rate limited, retrying after 5s...", file=sys.stderr)
+            time.sleep(5)
+            try:
+                resp2 = urllib.request.urlopen(req, timeout=10)
+                data2 = json.loads(resp2.read())
+                return True, None, data2.get("title", "")
+            except Exception as e2:
+                return None, None, f"Rate limited — retry failed: {e2}"
+        return None, None, f"HTTP {e.code}"
+    except Exception as e:
+        print(f"  [WARN] API call failed: {e}", file=sys.stderr)
+        return None, None, str(e)[:100]
+
+def update_product_db(code, available, price, title):
+    prod = sqlite3.connect(os.path.join(DB_DIR, "product_catalog.db"))
+    if available is True:
+        prod.execute("""UPDATE products SET title=?, price=?,
+            last_api_check=CURRENT_TIMESTAMP, is_available=1,
+            last_available=CURRENT_TIMESTAMP WHERE product_code=?""",
+            (title, price, code))
+    elif available is False:
+        prod.execute("""UPDATE products SET last_api_check=CURRENT_TIMESTAMP,
+            is_available=0 WHERE product_code=?""", (code,))
+    else:
+        prod.execute("""UPDATE products SET last_api_check=CURRENT_TIMESTAMP
+            WHERE product_code=?""", (code,))
+    prod.commit()
+    prod.close()
+
+def main():
+    args = [a for a in sys.argv[1:] if not a.startswith('--') and a != '-q']
+    quiet = '--quiet' in sys.argv or '-q' in sys.argv
+    target = args[0] if args else "all"
+    api_key = get_viator_key()
+    if not api_key:
+        print("ERROR: VIATOR_API_KEY not found")
+        sys.exit(1)
+
+    print(f"Product Sync — {target} — {datetime.now().isoformat()[:19]}\n")
+    sites = get_sites(target)
+    results = {"checked": 0, "available": 0, "disappeared": 0, "errors": 0,
+               "disappeared_list": [], "error_list": []}
+
+    for site_id, _ in sites:
+        if not quiet:
+            print(f"--- {site_id} ---")
+        products = get_products(site_id)
+        for code in products:
+            available, price, title = check_product(api_key, code)
+            if available is True:
+                results["available"] += 1
+                update_product_db(code, True, price, title)
+                pstr = f"${price}" if price else "no price"
+                if not quiet:
+                    print(f"  OK {code}: {title[:55]} — {pstr}")
+            elif available is False:
+                results["disappeared"] += 1
+                results["disappeared_list"].append(f"{site_id}:{code}")
+                update_product_db(code, False, None, title)
+                print(f"  !! {code}: DISAPPEARED — {title[:55]}")
+            else:
+                results["errors"] += 1
+                results["error_list"].append(f"{site_id}:{code} — {title}")
+                update_product_db(code, None, None, title)
+                print(f"  ?? {code}: {title} ({title if isinstance(title, str) else ''})")
+            results["checked"] += 1
+            time.sleep(1.1)
+
+        # update site timestamp
+        reg = sqlite3.connect(os.path.join(DB_DIR, "site_registry.db"))
+        reg.execute("UPDATE sites SET last_product_sync_at=CURRENT_TIMESTAMP WHERE site_id=?",
+                    (site_id,))
+        reg.commit()
+        reg.close()
+
+    print(f"\n{'='*50}")
+    print(f"Sync complete: {target}")
+    print(f"  Checked:     {results['checked']}")
+    print(f"  Available:   {results['available']}")
+    print(f"  Disappeared: {results['disappeared']}")
+    print(f"  Errors:      {results['errors']}")
+    if results["disappeared_list"]:
+        print(f"\n!!! DISAPPEARED PRODUCTS — remove CTAs immediately:")
+        for d in results["disappeared_list"]:
+            print(f"  -> {d}")
+    if results["error_list"]:
+        print(f"\n?? ERRORS — may need retry:")
+        for e in results["error_list"]:
+            print(f"  -> {e}")
+
+    sys.exit(1 if results["disappeared"] > 0 else 0)
+
+if __name__ == "__main__":
+    main()

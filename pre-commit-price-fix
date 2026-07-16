@@ -1,0 +1,32 @@
+#!/bin/bash
+# Pre-commit hook: auto-fix Viator price drifts before commit
+# Only runs when HTML files are staged.
+
+REPO=$(basename "$(git rev-parse --show-toplevel 2>/dev/null)" 2>/dev/null)
+[ -z "$REPO" ] && exit 0
+
+# Map repo name to site_id for viator_cli.py
+case "$REPO" in
+    madeira-hiking|madeira-trail-guide) SITE="madeira-hiking" ;;
+    porto-wine-tours)                  SITE="porto-wine-tours" ;;
+    tenerife-outdoor-guide)            SITE="tenerife-outdoor-guide" ;;
+    lapland-adventure-guide)           SITE="lapland-adventure-guide" ;;
+    *) exit 0 ;;  # Not a fleet site repo
+esac
+
+# Only run if HTML files are staged
+STAGED_HTML=$(git diff --cached --name-only --diff-filter=ACM | grep '\.html$')
+[ -z "$STAGED_HTML" ] && exit 0
+
+SCRIPT="$HOME/.hermes/affiliate-crons/scripts/viator_cli.py"
+[ ! -f "$SCRIPT" ] && exit 0
+
+echo "🔍 Checking Viator prices..."
+cd "$HOME/.hermes/affiliate-crons/scripts" && \
+    python3 viator_cli.py compare --site "$SITE" --fix --compact --quiet 2>&1 | \
+    grep -E 'FIXED|checked|mismatches|fixed' | tail -3
+
+# Re-stage any HTML files that were modified by the price fix
+git add -u '*.html' 2>/dev/null
+
+exit 0  # Never block commit for price issues

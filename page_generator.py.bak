@@ -1,0 +1,700 @@
+#!/usr/bin/env python3
+"""
+Page Generator — Phase 3 of content pipeline.
+Reads a topic brief + content bank, generates EEAT-grade HTML via DeepSeek Flash.
+
+Usage: python3 page_generator.py <site_slug> [brief_index]
+  brief_index: 0-based index into the briefs array (default: first unused)
+
+Environment: needs DEEPSEEK_API_KEY and DEEPSEEK_BASE_URL
+  Source with: set -a; source ~/.hermes/.env; set +a
+"""
+import sys, os, json, yaml, time, re
+from datetime import datetime
+from urllib.request import Request, urlopen
+
+CONTENT_BANKS_DIR = os.path.expanduser("~/.hermes/affiliate-crons/content-banks")
+BRIEFS_DIR = os.path.expanduser("~/.hermes/affiliate-crons/briefs")
+OUTPUT_DIR = os.path.expanduser("~/.hermes/affiliate-crons/generated")
+STATE_FILE = os.path.expanduser("~/.hermes/affiliate-crons/state/generation_state.json")
+
+# DeepSeek Flash via OpenAI-compatible API
+API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
+BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+MODEL = "deepseek-chat"  # DeepSeek Flash
+
+
+# ── Article templates ──────────────────────────────────────────────
+TEMPLATES = {
+    "destination_guide": {
+        "narrative_first": True,
+        "structure": [
+            "H2: I Didn't Expect {destination} to Feel Like This",
+            "H3: {product_1} — The Tour That Saved My Trip",
+            "H2: The Moments That Made {niche} in {destination} Unforgettable",
+            "H3: {product_2} — A Hidden Gem Worth Discovering",
+            "H2: What Really Surprised Me About {destination}",
+            "H2: {persona_name}'s Insider Tips for Getting It Right",
+            "H2: What I Wish I'd Known Before I Went",
+        ],
+        "note": "NARRATIVE-FIRST: Paint a personal, experiential journey. First-person throughout."
+    },
+    "product_roundup": {
+        "narrative_first": True,
+        "structure": [
+            "H2: I Tried Every {niche} Tour in {destination} — Here's What Happened",
+            "H3: {product_1}",
+            "H2: The Best Value Pick for {niche_doers}",
+            "H3: {product_2}",
+            "H2: Worth the Splurge: {product_3}",
+            "H3: {product_3}",
+            "H2: What I Wish I'd Known Before I Went",
+        ],
+        "note": "NARRATIVE-FIRST: Honest, first-person reviews. Include what went wrong too."
+    },
+    "beginner_guide": {
+        "narrative_first": True,
+        "structure": [
+            "H2: I Remember My First {niche} Experience — Here's What I Wish I'd Known",
+            "H3: {product_1} — Perfect for First-Timers",
+            "H2: Finding Your Feet: Where to Start in {destination}",
+            "H3: {product_2} — The Easiest Way In",
+            "H2: What Nobody Tells You Before Your First {niche} Trip",
+            "H2: What I Wish I'd Known Before I Went",
+        ],
+        "note": "NARRATIVE-FIRST: Empathetic, personal. Address fears with real stories."
+    },
+    "seasonal_guide": {
+        "narrative_first": True,
+        "structure": [
+            "H2: I've Been to {destination} in Every Season — Here's the Truth",
+            "H3: {product_1} — Best in Peak Season",
+            "H2: The Month That Changed How I See {destination}",
+            "H3: {product_2} — Surprisingly Great in Low Season",
+            "H2: Packing Lessons I Learned the Hard Way",
+            "H2: What I Wish I'd Known Before I Went",
+        ],
+        "note": "NARRATIVE-FIRST: Personal seasonal experiences with practical data woven in."
+    },
+    "comparison": {
+        "narrative_first": True,
+        "structure": [
+            "H2: I Did Both {option_a} and {option_b} — Here's What Nobody Tells You",
+            "H3: {product_1} — The {option_a} Experience",
+            "H2: Why {option_a} Nearly Won Me Over",
+            "H3: {product_2} — The {option_b} Experience",
+            "H2: The Moment I Made My Decision",
+            "H2: What I Wish I'd Known Before I Went",
+        ],
+        "note": "NARRATIVE-FIRST: Personal comparison based on real experience."
+    },
+    "itinerary": {
+        "narrative_first": True,
+        "structure": [
+            "H2: My {niche} Week in {destination} — Every High and Low",
+            "H3: {product_1} — The Highlight of Day 1",
+            "H2: The Day Everything Went Wrong (and Right)",
+            "H3: {product_2} — My Day 3 Savior",
+            "H2: What I'd Do Differently Next Time",
+            "H2: What I Wish I'd Known Before I Went",
+        ],
+        "note": "NARRATIVE-FIRST: Chronological personal journey with honest highs and lows."
+    },
+    "local_tips": {
+        "narrative_first": True,
+        "structure": [
+            "H2: What the Guidebooks Don't Tell You About {destination} {niche}",
+            "H3: {product_1} — A Local's Secret Pick",
+            "H2: The Mistakes I Made So You Don't Have To",
+            "H3: {product_2} — The One Tour Locals Actually Do",
+            "H2: Where to Skip and Where to Splurge",
+            "H2: What I Wish I'd Known Before I Went",
+        ],
+        "note": "NARRATIVE-FIRST: Insider perspective with personal stories about local experiences."
+    }
+}
+
+
+def load_content_bank(slug):
+    path = os.path.join(CONTENT_BANKS_DIR, f"{slug}.yaml")
+    with open(path) as f:
+        return yaml.safe_load(f)
+
+
+def load_briefs(slug):
+    path = os.path.join(BRIEFS_DIR, f"{slug}.json")
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        return json.load(f)
+
+
+def load_state():
+    if os.path.exists(STATE_FILE):
+        with open(STATE_FILE) as f:
+            return json.load(f)
+    return {}
+
+
+def save_state(state):
+    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f, indent=2, default=str)
+
+
+def get_article_count(slug):
+    """Count existing generated articles for this site."""
+    site_dir = os.path.join(OUTPUT_DIR, slug)
+    if not os.path.exists(site_dir):
+        return 0
+    return len([f for f in os.listdir(site_dir) if f.endswith(".html")])
+
+
+def fill_narrative_variables(structure, brief, cb):
+    """Fill template variables in structure items, including {{double_brace}} narrative vars.
+
+    Args:
+        structure: List of heading strings with {placeholder}s.
+        brief: Topic brief dict with products_to_feature, narrative_vars, etc.
+        cb: Content bank dict with site, voice, products data.
+
+    Returns:
+        List of filled heading strings.
+    """
+    site = cb.get("site", {})
+    voice = cb.get("voice", {})
+    products = cb.get("products", [])
+    # Normalize products — handle both flat list and {featured: [...]} dict
+    if isinstance(products, dict):
+        flat = []
+        for key in ("featured", "products", "tours", "top", "others"):
+            vals = products.get(key, [])
+            if isinstance(vals, list):
+                flat.extend(vals)
+        products = flat if flat else list(products.values())[0] if products else []
+    # Accept both viator_id and code field names
+    product_map = {}
+    for p in products:
+        pid = p.get("viator_id") or p.get("code", "")
+        if pid:
+            product_map[pid] = p
+
+    niche = site.get("niche", "travel")
+    destination = site.get("destination", niche)
+    persona_name = voice.get("persona_name", "Your Guide")
+    niche_doers = get_niche_doers(niche)
+
+    # Get narrative template variables from brief
+    narrative_vars = brief.get("narrative_vars", {})
+
+    filled = []
+    for h in structure:
+        h = h.replace("{destination}", destination)
+        h = h.replace("{niche}", niche)
+        h = h.replace("{persona_name}", persona_name)
+        h = h.replace("{niche_doers}", niche_doers)
+        h = h.replace("{option_a}", brief.get("option_a", "Option A"))
+        h = h.replace("{option_b}", brief.get("option_b", "Option B"))
+        # Product placeholders
+        for i, pid in enumerate(brief.get("products_to_feature", [])[:3]):
+            p = product_map.get(pid, {})
+            h = h.replace(f"{{product_{i+1}}}", p.get("title", f"Product {i+1}"))
+        # {{double_brace}} narrative vars from brief
+        for key, val in narrative_vars.items():
+            h = h.replace("{{" + key + "}}", str(val))
+        # Fallback: replace any remaining {{...}} with generic fallback
+        h = re.sub(r"\{\{(\w+)\}\}", lambda m: narrative_vars.get(m.group(1), f"[[{m.group(1)}]]"), h)
+        filled.append(h)
+    return filled
+
+
+def build_system_prompt(cb):
+    """Construct the system prompt from the content bank's voice guide."""
+    voice = cb["voice"]
+    persona = voice["persona_name"]
+    bio = voice.get("persona_bio") or voice.get("persona_backstory", "")
+    if not bio:
+        raise KeyError("persona_bio or persona_backstory required in voice section")
+    bio_short = bio.split(".")[0].strip() if "." in bio else bio[:80]
+    tone = voice["tone"]
+    dos = "\n".join(f"- {d}" for d in voice.get("dos", []))
+    donts = "\n".join(f"- {d}" for d in voice.get("donts", []))
+    exemplars = voice.get("exemplars", [])
+    ex_text = "\n\n".join(f'"{e.strip()}"' for e in exemplars[:5])
+
+    # Get Viator affiliate params from site registry
+    import sqlite3
+    pid, mcid = "P00303273", "42383"  # fallback
+    try:
+        db = sqlite3.connect(os.path.expanduser("~/.hermes/affiliate-crons/db/site_registry.db"))
+        row = db.execute("SELECT viator_pid, viator_mcid FROM sites WHERE site_id=?",
+                        (cb["site"]["slug"],)).fetchone()
+        if row:
+            pid, mcid = row[0], row[1]
+        db.close()
+    except Exception:
+        pass
+
+    today = __import__("datetime").datetime.now().strftime("%Y-%m-%d")
+
+    # Narrative-first supplementary content (optional)
+    personal_stories = cb.get("personal_stories", [])
+    personal_stories_text = "\n".join(f"- {s}" for s in personal_stories) if personal_stories else "None provided."
+    practical_logistics = cb.get("practical_logistics", [])
+    practical_logistics_text = "\n".join(f"- {l}" for l in practical_logistics) if practical_logistics else "None provided."
+
+    return f"""You are {persona}, {bio}
+
+WRITING STYLE: {tone}
+
+DO:
+{dos}
+
+DON'T:
+{donts}
+
+VOICE EXAMPLES — write exactly like this:
+{ex_text}
+
+NARRATIVE-FIRST MODE:
+When the TEMPLATE NOTE in the user prompt starts with "NARRATIVE-FIRST:", follow these additional rules:
+- Use personal hooks and storytelling for ALL H2s (e.g., "I Didn't Expect X to Feel Like This" not "Best Time to Visit X")
+- Include a "What I Wish I'd Known Before I Went" section near the end
+- Feature recommended products as H3s under relevant narrative H2s, not standalone H2s
+- Weave affiliate links naturally into the narrative prose — at least 2 inline Viator links within the body
+- Every claim must vividly sound like it comes from PERSONAL EXPERIENCE, not research or aggregation
+- If the content bank provides personal stories, weave them into the narrative naturally
+- If the content bank provides practical logistics, distribute them through the narrative rather than listing them in a separate section
+
+PERSONAL STORIES TO WEAVE IN (if provided):
+{personal_stories_text}
+
+PRACTICAL LOGISTICS TO INCLUDE (if provided):
+{practical_logistics_text}
+
+OUTPUT FORMAT: Return a COMPLETE, valid HTML document (no markdown, no code fences, no explanations).
+The document MUST follow this structure:
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="COMPELLING_META_DESCRIPTION_WITH_KEYWORD">
+  <title>ARTICLE_TITLE | SITE_NAME</title>
+  <link rel="stylesheet" href="/css/style.css">
+  <link rel="canonical" href="https://{{DOMAIN}}/{{SLUG}}">
+</head>
+<body>
+  <article>
+    <header>
+      <h1>ARTICLE_TITLE_WITH_PRIMARY_KEYWORD_AND_DESTINATION</h1>
+      <p class="byline">By {persona} — {bio_short}</p>
+    </header>
+    <main>
+      <!-- H2 sections here -->
+    </main>
+    <section class="faq">
+      <h2>Frequently Asked Questions</h2>
+      <!-- 4-6 Q&A pairs from the article's comparison questions -->
+    </section>
+    <footer>
+      <p>SIGN_OFF_LINE</p>
+      <p class="affiliate-disclosure">We earn a commission when you book through our links on Viator (PID {pid}), at no extra cost to you. This is how we keep the site free. <a href="/about">Learn more →</a></p>
+    </footer>
+  </article>
+  <script type="application/ld+json">
+  {{
+    "@context": "https://schema.org",
+    "@type": "Article",
+    "headline": "ARTICLE_TITLE",
+    "description": "META_DESCRIPTION",
+    "author": {{"@type": "Person", "name": "{persona}"}},
+    "datePublished": "{today}",
+    "dateModified": "{today}",
+    "url": "https://{{DOMAIN}}/{{SLUG}}"
+  }}
+  </script>
+  <script type="application/ld+json">
+  {{
+    "@context": "https://schema.org",
+    "@type": "FAQPage",
+    "mainEntity": [
+      {{"@type": "Question", "name": "...", "acceptedAnswer": {{"@type": "Answer", "text": "..."}}}}
+    ]
+  }}
+  </script>
+</body>
+</html>
+
+Viator product cards MUST use this format — note the PID/MCID params are REQUIRED:
+  <div class="product-card" data-viator-id="{{PRODUCT_ID}}">
+    <h3>{{PRODUCT_NAME}}</h3>
+    <p class="product-blurb">{{YOUR_HONEST_RECOMMENDATION_WITH_PRO_AND_CON}}</p>
+    <a href="https://www.viator.com/tours/{{PRODUCT_ID}}?pid={pid}&mcid={mcid}&medium=link" class="cta-button" rel="sponsored">Check Availability →</a>
+  </div>
+
+Internal links use relative URLs: <a href="/slug-name">descriptive anchor text</a>
+External authority links are REQUIRED: link to official sources when referencing trail conditions, weather, or park information.
+
+INLINE AFFILIATE LINKS — at least 2 Viator links MUST be embedded naturally in the body text:
+  <a href="https://www.viator.com/tours/{{PRODUCT_ID}}?pid={pid}&mcid={mcid}&medium=link" rel="sponsored">descriptive anchor text</a>
+These go INSIDE paragraph text, not just in product cards. Weave them into the narrative naturally.
+
+CRITICAL RULES:
+1. Return the COMPLETE <!DOCTYPE html>... document — nothing before, nothing after.
+2. Write in first person as {persona}. Match the exact tone of the voice examples.
+3. **CRITICAL**: The H1 MUST contain the destination name (e.g., "Madeira") AND the primary keyword. Example: "PR1 vs PR1.2 Madeira: Which Pico Ruivo Hike Should You Choose?"
+4. Include 4-6 FAQ entries with FAQPage schema. Structure as real questions travelers ask.
+5. Be honest and specific. Real experiences beat generic descriptions. Include "who it's NOT for" on every section.
+6. NO product prices — they change too fast.
+7. Article body should be 1,500-2,200 words — thorough, substantive, competitive.
+8. Include at least 2 internal links to related articles and 2 external links to official sources.
+9. EVERY claim should sound like it comes from personal experience, not a search engine.
+10. Use the exact product-card HTML format above — with PID/MCID params — for every Viator link.
+11. Put the FAQ section BEFORE the product cards and footer.
+12. For the canonical URL, use the EXACT domain from the site config — do not invent domains.
+13. Include at least 2 inline Viator affiliate links within the article body text (not just in product cards). Format: <a href="https://www.viator.com/tours/{{PRODUCT_ID}}?pid={pid}&mcid={mcid}&medium=link" rel="sponsored">descriptive anchor text</a>"""
+
+
+def build_user_prompt(cb, brief):
+    """Construct the user prompt from the topic brief."""
+    site = cb["site"]
+    voice = cb["voice"]
+    knowledge = cb["knowledge"]
+    products = cb.get("products", [])
+
+    # Normalize products structure — handles both flat list and {featured: [...]} dict
+    if isinstance(products, dict):
+        flat = []
+        for key in ("featured", "products", "tours", "top", "others"):
+            vals = products.get(key, [])
+            if isinstance(vals, list):
+                flat.extend(vals)
+        products = flat if flat else list(products.values())[0] if products else []
+
+    template_name = brief.get("template", "destination_guide")
+    template = TEMPLATES.get(template_name, TEMPLATES["destination_guide"])
+
+    # Map products by viator_id or code (accept both field names)
+    product_map = {}
+    for p in products:
+        pid = p.get("viator_id") or p.get("code", "")
+        if pid:
+            product_map[pid] = p
+
+    # Format featured products
+    featured = []
+    for pcode in brief.get("products_to_feature", [])[:3]:
+        p = product_map.get(pcode)
+        if p:
+            featured.append(f"  - {pcode}: {p.get('title', 'Untitled')} — {p.get('custom_blurb', '')} (best for: {p.get('best_for', 'all')})")
+
+    # Format facts
+    facts_text = "\n".join(f"  - {f}" for f in brief.get("facts_to_include", []))
+
+    # Format structure using fill_narrative_variables (handles {placeholders} and {{double_brace}} vars)
+    structure_items = template["structure"]
+    filled_structure = fill_narrative_variables(structure_items, brief, cb)
+
+    # Get Viator affiliate params from site registry
+    import sqlite3
+    pid, mcid = "P00303273", "42383"  # fallback
+    try:
+        db = sqlite3.connect(os.path.expanduser("~/.hermes/affiliate-crons/db/site_registry.db"))
+        row = db.execute("SELECT viator_pid, viator_mcid FROM sites WHERE site_id=?",
+                        (cb["site"]["slug"],)).fetchone()
+        if row:
+            pid, mcid = row[0], row[1]
+        db.close()
+    except Exception:
+        pass
+
+    # Extract supplementary content (all optional — .get() with empty defaults)
+    local_tips = knowledge.get("local_tips", [])
+    local_tips_text = "\n".join(f"  - {t}" for t in local_tips) if local_tips else "  None in knowledge base."
+    common_mistakes = knowledge.get("common_mistakes", [])
+    common_mistakes_text = "\n".join(f"  - {m}" for m in common_mistakes) if common_mistakes else "  None in knowledge base."
+    personal_stories = cb.get("personal_stories", [])
+    personal_stories_text = "\n".join(f"  - {s}" for s in personal_stories) if personal_stories else "  None provided."
+    practical_logistics = cb.get("practical_logistics", [])
+    practical_logistics_text = "\n".join(f"  - {l}" for l in practical_logistics) if practical_logistics else "  None provided."
+
+    # Narrative variables from brief (for {{double_brace}} placeholders in content, not headings)
+    narrative_vars = brief.get("narrative_vars", {})
+    narrative_vars_text = "\n".join(f"  - {k}: {v}" for k, v in narrative_vars.items()) if narrative_vars else "  None."
+
+    return f"""Write a complete HTML article using the following specifications.
+
+ARTICLE TYPE: {template_name}
+TEMPLATE NOTE: {template['note']}
+
+TITLE: {brief['title']}
+SLUG: {brief.get('slug', '')}
+TARGET KEYWORD: {brief.get('target_keyword', '')}
+SEARCH INTENT: {brief.get('search_intent', 'informational')}
+SERP GAP: {brief.get('serp_gap', '')}
+
+ARTICLE STRUCTURE (follow these H2s/H3s exactly):
+{chr(10).join(filled_structure)}
+
+KEY FACTS TO INCLUDE (from our knowledge base):
+{facts_text}
+
+LOCAL TIPS FROM KNOWLEDGE BASE:
+{local_tips_text}
+
+COMMON MISTAKES TO ADDRESS:
+{common_mistakes_text}
+
+PERSONAL STORIES TO WEAVE IN:
+{personal_stories_text}
+
+PRACTICAL LOGISTICS TO INCLUDE:
+{practical_logistics_text}
+
+NARRATIVE VARIABLES (use these values in the narrative):
+{narrative_vars_text}
+
+PRODUCTS TO FEATURE:
+{chr(10).join(featured) if featured else '  None specified — use products from content bank that fit naturally.'}
+
+INTERNAL LINKS TO INCLUDE:
+{chr(10).join(f'  - /{link}' for link in brief.get('internal_links', [])) if brief.get('internal_links') else '  None yet — this may be an early article for this site.'}
+
+INLINE AFFILIATE LINK REQUIREMENT:
+You MUST include at least 2 inline Viator affiliate links within the article body text (not just in product cards).
+Use this format: <a href="https://www.viator.com/tours/{{PRODUCT_ID}}?{pid}&mcid={mcid}&medium=link" rel="sponsored">descriptive anchor text</a>
+Weave them naturally into the narrative — e.g., "I booked the [tour name](affiliate link) and it was..." as HTML links.
+
+TONE NOTES: {brief.get('tone_notes', 'Write naturally in the assigned voice.')}
+
+SEASONAL CONTEXT: {knowledge.get('seasonal_notes', '')[:500]}
+
+Generate the complete HTML article now. Output ONLY the HTML (no markdown fences, no explanations)."""
+
+
+def get_niche_doers(niche):
+    """Pluralize a niche for 'Best for experienced X' type phrasing."""
+    mapping = {
+        "surfing": "surfers", "diving": "divers", "hiking": "hikers",
+        "fishing": "anglers", "climbing": "climbers", "skiing": "skiers",
+        "sailing": "sailors", "kayaking": "kayakers", "cycling": "cyclists",
+        "wine tasting": "wine lovers", "port tasting": "port enthusiasts", "cooking": "cooks",
+    }
+    return mapping.get(niche, f"{niche} enthusiasts")
+
+
+def call_deepseek(system_prompt, user_prompt, max_tokens=6000):
+    """Call DeepSeek Flash API with retry and backoff."""
+    try:
+        from scripts.api_utils import call_with_retry
+    except ImportError:
+        from api_utils import call_with_retry
+
+    if not API_KEY:
+        raise RuntimeError("DEEPSEEK_API_KEY not set. Source ~/.hermes/.env first.")
+
+    data, err = call_with_retry(
+        url=f"{BASE_URL}/v1/chat/completions",
+        payload={
+            "model": MODEL,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            "max_tokens": max_tokens,
+            "temperature": 0.7,
+            "stream": False
+        },
+        headers={"Authorization": f"Bearer {API_KEY}"},
+        max_retries=3,
+        timeout=120
+    )
+
+    if err:
+        raise RuntimeError(f"DeepSeek API error: {err}")
+
+    return data["choices"][0]["message"]["content"]
+
+
+def extract_html(text):
+    """Extract HTML from model response — handles markdown fences and other wrappers."""
+    # Remove markdown code fences
+    text = re.sub(r'^```html?\s*\n', '', text, flags=re.MULTILINE)
+    text = re.sub(r'\n```\s*$', '', text, flags=re.MULTILINE)
+    # If the response starts with DOCTYPE or <html, take everything
+    if text.strip().startswith("<!DOCTYPE") or text.strip().startswith("<html"):
+        return text.strip()
+    # Otherwise find the HTML block
+    match = re.search(r'(<!DOCTYPE.*?</html>)', text, re.DOTALL | re.IGNORECASE)
+    if match:
+        return match.group(1)
+    # Fallback: return everything
+    return text.strip()
+
+
+def generate_article(slug, cb, brief):
+    """Generate a single article from a brief."""
+    system_prompt = build_system_prompt(cb)
+    user_prompt = build_user_prompt(cb, brief)
+
+    article_slug = brief.get("slug", "untitled")
+    print(f"  Generating: {brief.get('title', article_slug)}")
+
+    try:
+        raw = call_deepseek(system_prompt, user_prompt)
+        html = extract_html(raw)
+
+        # Save to output
+        site_dir = os.path.join(OUTPUT_DIR, slug)
+        os.makedirs(site_dir, exist_ok=True)
+        out_path = os.path.join(site_dir, f"{article_slug}.html")
+
+        # POST-PROCESSING: Enforce www. prefix on canonical URLs
+        # The model sometimes uses bare domain (site.com) instead of www.site.com
+        html = re.sub(
+            r'<link[^>]*rel="canonical"[^>]*href="https://(?!www\.)([^"]+)"',
+            lambda m: m.group(0).replace(
+                f'//{m.group(1)}', f'//www.{m.group(1)}'
+            ),
+            html
+        )
+        # Also fix JSON-LD url fields that may have non-www
+        html = re.sub(
+            r'"url"\s*:\s*"https://(?!www\.)([^"]+)"',
+            lambda m: m.group(0).replace(
+                f'//{m.group(1)}', f'//www.{m.group(1)}'
+            ),
+            html
+        )
+
+        # DOMAIN VALIDATION: LLM sometimes hallucinates wrong domain entirely.
+        # Check against site_registry.db and force-correct any wrong domain.
+        expected_domain = None
+        try:
+            row = sqlite3.connect(os.path.expanduser(
+                "~/.hermes/affiliate-crons/db/site_registry.db"
+            )).execute(
+                "SELECT domain FROM sites WHERE site_id=?", (slug,)
+            ).fetchone()
+            if row and row[0] and row[0] != "unknown":
+                expected_domain = row[0].lower().strip()
+        except Exception:
+            pass
+        if expected_domain:
+            wrong_domains = set()
+            for m in re.finditer(r'https?://([a-zA-Z0-9][-a-zA-Z0-9]*\.[a-zA-Z0-9][-a-zA-Z0-9.]*\.[a-z]{2,})', html):
+                found = m.group(1).lower().replace('www.', '')
+                if found != expected_domain and '.viator.com' not in found and 'schema.org' not in found:
+                    wrong_domains.add(m.group(1))
+            for wrong in wrong_domains:
+                html = html.replace(wrong, f'www.{expected_domain}')
+                print(f"  FIXED WRONG DOMAIN: {wrong} -> www.{expected_domain}")
+
+        # JSON-LD REPAIR: LLM-generated FAQ blocks often contain unescaped control
+        # characters that break JSON.parse. Strip control chars and fix common issues.
+        import json as json_mod
+        ld_pattern = re.compile(
+            r'(<script[^>]*type="application/ld\+json"[^>]*>)(.*?)(</script>)',
+            re.DOTALL
+        )
+        def repair_jsonld(match):
+            raw = match.group(2)
+            # Strip invalid control characters (except \n, \r, \t)
+            cleaned = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', raw)
+            try:
+                json_mod.loads(cleaned)
+                return match.group(1) + cleaned + match.group(3)
+            except json_mod.JSONDecodeError:
+                # Try escaping common offenders
+                fixed = cleaned.replace('\\', '\\\\').replace('"', '\\"')
+                # Don't double-escape already-escaped
+                fixed = re.sub(r'(?<!\\\\)\\\\"', '\\"', fixed)
+                return match.group(1) + cleaned + match.group(3)  # Keep original if unfixable
+        html = ld_pattern.sub(repair_jsonld, html)
+
+        with open(out_path, "w") as f:
+            f.write(html)
+        if not html.strip().startswith("<!") and not html.strip().startswith("<"):
+            print(f"  WARNING: Output may not be valid HTML. First 100 chars: {html[:100]}")
+        else:
+            print(f"  Saved: {out_path} ({len(html)} bytes)")
+
+        return out_path
+    except Exception as e:
+        print(f"  ERROR generating {article_slug}: {e}")
+        return None
+
+
+def main():
+    if not API_KEY:
+        print("ERROR: DEEPSEEK_API_KEY not set.")
+        print("Run: set -a; source ~/.hermes/.env; set +a")
+        sys.exit(1)
+
+    if len(sys.argv) < 2:
+        print("Usage: python3 page_generator.py <site_slug> [brief_index] [--count N]")
+        sys.exit(1)
+
+    slug = sys.argv[1]
+    brief_index = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else None
+    count = 1
+
+    # Parse --count
+    for i, arg in enumerate(sys.argv):
+        if arg == "--count" and i + 1 < len(sys.argv):
+            count = int(sys.argv[i + 1])
+
+    print(f"Page Generator — {slug} — {datetime.now().isoformat()[:19]}\n")
+
+    cb = load_content_bank(slug)
+    if not cb:
+        print(f"ERROR: No content bank for {slug}")
+        sys.exit(1)
+
+    briefs_data = load_briefs(slug)
+    if not briefs_data or not briefs_data.get("briefs"):
+        print(f"ERROR: No topic briefs for {slug}. Run topic-planner-weekly first.")
+        sys.exit(1)
+
+    briefs = briefs_data["briefs"]
+    state = load_state()
+    site_state = state.get(slug, {"generated": []})
+
+    # Determine which briefs to generate
+    to_generate = []
+    if brief_index is not None:
+        if brief_index < len(briefs):
+            to_generate = [briefs[brief_index]]
+        else:
+            print(f"ERROR: brief_index {brief_index} out of range ({len(briefs)} briefs)")
+            sys.exit(1)
+    else:
+        # Generate next N unused briefs
+        generated_slugs = set(site_state.get("generated", []))
+        for b in briefs:
+            if b.get("slug") not in generated_slugs and len(to_generate) < count:
+                to_generate.append(b)
+
+    if not to_generate:
+        print("All briefs already generated. Nothing to do.")
+        sys.exit(0)
+
+    print(f"Generating {len(to_generate)} article(s)...\n")
+
+    for brief in to_generate:
+        out_path = generate_article(slug, cb, brief)
+        if out_path:
+            site_state.setdefault("generated", []).append(brief["slug"])
+        time.sleep(0.5)  # polite spacing between API calls
+
+    state[slug] = site_state
+    save_state(state)
+
+    total = get_article_count(slug)
+    print(f"\nDone. {slug}: {total} articles total.")
+
+
+if __name__ == "__main__":
+    main()
