@@ -246,6 +246,41 @@ class TestUrlToSite(unittest.TestCase):
         slug = aal.url_to_site(path, self.sites)
         self.assertEqual(slug, "porto-sommelier")
 
+    def test_strip_www_does_not_strip_charset(self):
+        # Regression: ``host.lstrip("www.")`` treats its arg as a *character set*
+        # and would consume any leading 'w'/'.' characters. A site whose
+        # hostname starts with 'w' but isn't 'www.' (e.g. west.com, wine.co)
+        # would be silently mangled into 'est.com' / 'ine.co'. The fix uses
+        # ``removeprefix`` so only the literal 'www.' is removed.
+        self.assertEqual(aal.strip_www("www.vinesandplates.com"),
+                         "vinesandplates.com")
+        self.assertEqual(aal.strip_www("west.com"), "west.com")
+        self.assertEqual(aal.strip_www("wine.co"), "wine.co")
+        self.assertEqual(aal.strip_www("w.example.com"), "w.example.com")
+        self.assertEqual(aal.strip_www("WWW.Example.com"), "example.com")
+        self.assertEqual(aal.strip_www("plain.com"), "plain.com")
+
+    def test_url_to_site_does_not_mangle_hostnames_with_w_prefix(self):
+        # End-to-end check for the lstrip('www.') character-set bug.
+        # A site whose domain starts with 'w' (e.g. westwood.tours) used to be
+        # silently mangled into 'estwood.tours' because lstrip treats its arg
+        # as a *character set*. Add such a site directly to the in-memory
+        # registry so we can exercise url_to_site without depending on YAML
+        # serialisation.
+        from audit_action.site_registry import SiteConfig
+        self.sites["westwood"] = SiteConfig(
+            slug="westwood",
+            path=Path(self.tmp) / "westwood",
+            domain="westwood.tours",
+            fleet="saraswati",
+            images_dir=Path(self.tmp) / "westwood" / "images",
+        )
+        slug = aal.url_to_site("https://westwood.tours/foo/bar", self.sites)
+        self.assertEqual(slug, "westwood")
+        # www. prefix must still strip correctly.
+        slug_www = aal.url_to_site("https://www.westwood.tours/foo/bar", self.sites)
+        self.assertEqual(slug_www, "westwood")
+
 
 # ---------------------------------------------------------------------------
 # R12 detection
@@ -278,21 +313,21 @@ class TestR12Detection(unittest.TestCase):
 class TestProductCodeExtraction(unittest.TestCase):
 
     def test_extracts_simple_viator_link(self):
-        html = 'See <a href="https://www.viator.com/Paris-tours/ABC123?pid=P1">here</a>'
-        self.assertEqual(aal.extract_product_codes(html), ["ABC123"])
+        html = 'See <a href="https://www.viator.com/Paris-tours/217270P2?pid=P1">here</a>'
+        self.assertEqual(aal.extract_product_codes(html), ["217270P2"])
 
     def test_extracts_with_destination_prefix(self):
-        html = '<a href="https://www.viator.com/tours/d1234-XYZ789?pid=P1">x</a>'
-        self.assertEqual(aal.extract_product_codes(html), ["XYZ789"])
+        html = '<a href="https://www.viator.com/tours/d1234-162160P1?pid=P1">x</a>'
+        self.assertEqual(aal.extract_product_codes(html), ["162160P1"])
 
     def test_extracts_multiple_codes_deduped(self):
         html = '''
-            <a href="https://www.viator.com/foo/AAA1?x=1">a</a>
-            <a href="https://www.viator.com/bar/BBB2?y=2">b</a>
-            <a href="https://www.viator.com/baz/AAA1?z=3">c</a>
+            <a href="https://www.viator.com/foo/333P1?x=1">a</a>
+            <a href="https://www.viator.com/bar/555P2?y=2">b</a>
+            <a href="https://www.viator.com/baz/333P1?z=3">c</a>
         '''
         codes = aal.extract_product_codes(html)
-        self.assertEqual(codes, ["AAA1", "BBB2"])
+        self.assertEqual(codes, ["333P1", "555P2"])
 
     def test_no_codes_when_no_viator_link(self):
         self.assertEqual(aal.extract_product_codes("<p>no links</p>"), [])
@@ -314,9 +349,9 @@ class TestFindLocalProductImage(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def test_finds_jpg(self):
-        (self.images_dir / "ABC123.jpg").write_bytes(b"\xff\xd8\xff\xe0")
-        html = '<a href="https://www.viator.com/tours/ABC123?pid=1">x</a>'
-        self.assertEqual(aal.find_local_product_image(html, self.images_dir), "ABC123.jpg")
+        (self.images_dir / "217270P2.jpg").write_bytes(b"\xff\xd8\xff\xe0")
+        html = '<a href="https://www.viator.com/tours/217270P2?pid=1">x</a>'
+        self.assertEqual(aal.find_local_product_image(html, self.images_dir), "217270P2.jpg")
 
     def test_finds_png(self):
         (self.images_dir / "XYZ.png").write_bytes(b"\x89PNG\r\n")
@@ -331,18 +366,18 @@ class TestFindLocalProductImage(unittest.TestCase):
         self.assertIsNone(aal.find_local_product_image("<p>no links</p>", self.images_dir))
 
     def test_returns_none_when_images_dir_missing(self):
-        html = '<a href="https://www.viator.com/tours/ABC123?pid=1">x</a>'
+        html = '<a href="https://www.viator.com/tours/217270P2?pid=1">x</a>'
         self.assertIsNone(aal.find_local_product_image(html, Path(self.tmp) / "missing"))
 
     def test_first_matching_code_wins(self):
-        (self.images_dir / "AAA1.jpg").write_bytes(b"x")
+        (self.images_dir / "333P1.jpg").write_bytes(b"x")
         html = '''
-            <a href="https://www.viator.com/tours/BBB2?pid=1">b</a>
-            <a href="https://www.viator.com/tours/AAA1?pid=1">a</a>
+            <a href="https://www.viator.com/tours/555P2?pid=1">b</a>
+            <a href="https://www.viator.com/tours/333P1?pid=1">a</a>
         '''
-        # order in HTML is BBB2 first, AAA1 second — neither has image by default
-        # but with only AAA1.jpg present, must return AAA1.jpg
-        self.assertEqual(aal.find_local_product_image(html, self.images_dir), "AAA1.jpg")
+        # order in HTML is 555P2 first, 333P1 second — neither has image by default
+        # but with only 333P1.jpg present, must return 333P1.jpg
+        self.assertEqual(aal.find_local_product_image(html, self.images_dir), "333P1.jpg")
 
 
 # ---------------------------------------------------------------------------
@@ -354,18 +389,18 @@ class TestInjectImage(unittest.TestCase):
 
     def test_injects_before_first_viator_link(self):
         html = '''<h1>Tour Review</h1>
-<a href="https://www.viator.com/tours/ABC123?pid=1">Book now</a>'''
-        out = aal.inject_image_into_html(html, "ABC123.jpg")
+<a href="https://www.viator.com/tours/217270P2?pid=1">Book now</a>'''
+        out = aal.inject_image_into_html(html, "217270P2.jpg")
         self.assertIn('class="injected-product-image"', out)
         # <img> must come before the <a>
         img_pos = out.index('<img')
         a_pos = out.index('<a href="https://www.viator.com')
         self.assertLess(img_pos, a_pos)
-        self.assertIn('src="/images/ABC123.jpg"', out)
+        self.assertIn('src="/images/217270P2.jpg"', out)
 
     def test_injects_after_h1_when_no_viator_link(self):
         html = "<h1>Tour Review</h1><p>Some content here.</p>"
-        out = aal.inject_image_into_html(html, "ABC123.jpg")
+        out = aal.inject_image_into_html(html, "217270P2.jpg")
         h1_end = out.index("</h1>")
         img_pos = out.index("<img")
         self.assertGreater(img_pos, h1_end)
@@ -376,9 +411,9 @@ class TestInjectImage(unittest.TestCase):
         self.assertIn('<img src="/images/X.jpg"', out)
 
     def test_idempotent_no_double_inject(self):
-        html = '<h1>X</h1><a href="https://www.viator.com/tours/ABC123?pid=1">x</a>'
-        once = aal.inject_image_into_html(html, "ABC123.jpg")
-        twice = aal.inject_image_into_html(once, "ABC123.jpg")
+        html = '<h1>X</h1><a href="https://www.viator.com/tours/217270P2?pid=1">x</a>'
+        once = aal.inject_image_into_html(html, "217270P2.jpg")
+        twice = aal.inject_image_into_html(once, "217270P2.jpg")
         self.assertEqual(once, twice)
         self.assertEqual(twice.count('class="injected-product-image"'), 1)
 
@@ -418,19 +453,19 @@ class TestQueueAppend(unittest.TestCase):
     def test_appends_codes(self):
         with tempfile.TemporaryDirectory() as tmp:
             q = Path(tmp) / "site-20260101.queue"
-            n = aal.append_to_queue(q, ["ABC123", "DEF456"])
+            n = aal.append_to_queue(q, ["217270P2", "DEF456"])
             self.assertEqual(n, 2)
-            self.assertEqual(q.read_text().strip().splitlines(), ["ABC123", "DEF456"])
+            self.assertEqual(q.read_text().strip().splitlines(), ["217270P2", "DEF456"])
 
     def test_dedupes_against_existing_lines(self):
         with tempfile.TemporaryDirectory() as tmp:
             q = Path(tmp) / "site.queue"
-            q.write_text("ABC123\n# comment\nDEF456\n")
-            n = aal.append_to_queue(q, ["ABC123", "XYZ789", "def456"])
-            self.assertEqual(n, 1)  # only XYZ789 new
+            q.write_text("217270P2\n# comment\nDEF456\n")
+            n = aal.append_to_queue(q, ["217270P2", "162160P1", "def456"])
+            self.assertEqual(n, 1)  # only 162160P1 new
             lines = [ln for ln in q.read_text().splitlines() if ln.strip() and not ln.startswith("#")]
-            self.assertIn("XYZ789", lines)
-            self.assertIn("ABC123", lines)
+            self.assertIn("162160P1", lines)
+            self.assertIn("217270P2", lines)
 
     def test_appends_to_nonexistent_queue(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -480,7 +515,7 @@ class TestProcessPage(unittest.TestCase):
         self.site_dir.mkdir(parents=True)
         self.images_dir = self.site_dir / "images"
         self.images_dir.mkdir()
-        (self.images_dir / "ABC123.jpg").write_bytes(b"\xff\xd8fake")
+        (self.images_dir / "217270P2.jpg").write_bytes(b"\xff\xd8fake")
 
         self.yaml_path = Path(self.tmp) / "sites.yaml"
         write_minimal_sites_yaml(self.yaml_path, {
@@ -501,13 +536,13 @@ class TestProcessPage(unittest.TestCase):
         page.parent.mkdir(parents=True)
         page.write_text(
             '<h1>Douro Valley</h1>'
-            '<a href="https://www.viator.com/tours/ABC123?pid=1">Book</a>'
+            '<a href="https://www.viator.com/tours/217270P2?pid=1">Book</a>'
         )
         url = "https://porto-wine-tours.com/douro/index.html"
         result = make_audit_result(url, r12=True)
         action, qfiles = aal.process_page(url, result, self.sites, self.queue_dir, dry_run=False)
         self.assertEqual(action.status, "injected")
-        self.assertEqual(action.injected_filename, "ABC123.jpg")
+        self.assertEqual(action.injected_filename, "217270P2.jpg")
         self.assertIn('class="injected-product-image"', page.read_text())
 
     def test_queue_when_no_local_image(self):
@@ -565,13 +600,13 @@ class TestProcessPage(unittest.TestCase):
     def test_dry_run_does_not_write(self):
         page = self.site_dir / "dryrun" / "index.html"
         page.parent.mkdir(parents=True)
-        original = '<h1>X</h1><a href="https://www.viator.com/tours/ABC123?pid=1">x</a>'
+        original = '<h1>X</h1><a href="https://www.viator.com/tours/217270P2?pid=1">x</a>'
         page.write_text(original)
         url = "https://porto-wine-tours.com/dryrun/index.html"
         result = make_audit_result(url, r12=True)
         action, qfiles = aal.process_page(url, result, self.sites, self.queue_dir, dry_run=True)
         self.assertEqual(action.status, "injected")
-        self.assertEqual(action.injected_filename, "ABC123.jpg")
+        self.assertEqual(action.injected_filename, "217270P2.jpg")
         # File on disk must NOT be modified
         self.assertEqual(page.read_text(), original)
 
@@ -589,12 +624,12 @@ class TestEndToEndWithCachedAudit(unittest.TestCase):
         self.site_dir.mkdir(parents=True)
         self.images_dir = self.site_dir / "images"
         self.images_dir.mkdir()
-        (self.images_dir / "ABC123.jpg").write_bytes(b"\xff\xd8fake")
+        (self.images_dir / "217270P2.jpg").write_bytes(b"\xff\xd8fake")
 
         # Two pages: one with local image, one without
         (self.site_dir / "good").mkdir()
         (self.site_dir / "good" / "index.html").write_text(
-            '<h1>Good</h1><a href="https://www.viator.com/tours/ABC123?pid=1">x</a>'
+            '<h1>Good</h1><a href="https://www.viator.com/tours/217270P2?pid=1">x</a>'
         )
         (self.site_dir / "missing").mkdir()
         (self.site_dir / "missing" / "index.html").write_text(
@@ -741,10 +776,10 @@ class TestCLI(unittest.TestCase):
         self.site_dir.mkdir(parents=True)
         self.images_dir = self.site_dir / "images"
         self.images_dir.mkdir()
-        (self.images_dir / "ABC123.jpg").write_bytes(b"\xff\xd8fake")
+        (self.images_dir / "217270P2.jpg").write_bytes(b"\xff\xd8fake")
         (self.site_dir / "good").mkdir()
         (self.site_dir / "good" / "index.html").write_text(
-            '<h1>Good</h1><a href="https://www.viator.com/tours/ABC123?pid=1">x</a>'
+            '<h1>Good</h1><a href="https://www.viator.com/tours/217270P2?pid=1">x</a>'
         )
 
         self.yaml_path = Path(self.tmp) / "sites.yaml"

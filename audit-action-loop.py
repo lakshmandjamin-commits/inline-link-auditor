@@ -11,10 +11,17 @@ Post-generation action loop:
        - If not, queue the product code(s) for the Viator API fetcher.
   4. Log: injected count, queued count, pages that need manual curation.
 
-Fleet-agnostic: reads the site list from ~/.hermes/affiliate-crons/config/sites.yaml,
-which is shared with the image fetcher. Both Saraswati and Hanumanhermes fleets
-are supported — the script works against any subset selected with --site or
---fleet.
+This script is the thin orchestrator. The actual work is split across
+sibling modules:
+
+    audit_action.url_utils        URL <-> site mapping, URL file loading
+    audit_action.site_registry    SiteConfig + sites.yaml loader
+    audit_action.audit_runner     Wraps the image-placement audit CLI
+    audit_action.image_injection  Viator code extraction + <img> injection
+    audit_action.queue_io         Append-only queue files
+
+We re-export the public names here so existing imports (and the test suite,
+which loads this file via importlib) keep working unchanged.
 
 Usage:
   python3 audit-action-loop.py --urls /tmp/newly-generated.txt
@@ -33,15 +40,40 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
-import re
-import shutil
 import sys
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from pathlib import Path
-from typing import Any
-from urllib.parse import urlparse
+
+# ── Re-exports: keep the old single-file public API stable ─────────────────
+from audit_action.audit_runner import (
+    R12_RULE_ID,
+    has_r12_violation,
+    run_audit,
+)
+from audit_action.image_injection import (
+    DEFAULT_INJECT_IMG_TEMPLATE,
+    VIATOR_CODE_RE,
+    VIATOR_LINK_RE,
+    build_img_tag,
+    extract_product_codes,
+    extract_product_codes_for_queue,
+    find_local_product_image,
+    inject_image_into_file,
+    inject_image_into_html,
+)
+from audit_action.queue_io import append_to_queue
+from audit_action.site_registry import (
+    SiteConfig,
+    load_site_registry,
+    load_sites_yaml,
+)
+from audit_action.url_utils import (
+    load_urls,
+    strip_www,
+    url_to_local_file,
+    url_to_site,
+)
 
 # ── Constants ───────────────────────────────────────────────────────────────
 
@@ -56,433 +88,44 @@ DEFAULT_QUEUE_DIR = (
     Path.home() / ".hermes/affiliate-crons/queues/image-fetch"
 )
 
-R12_RULE_ID = "R12"
-
-# Matches Viator product links like
-#   https://www.viator.com/.../d1234-ABC123?...   →  ABC123
-#   https://www.viator.com/.../ABC123?...          →  ABC123
-VIATOR_CODE_RE = re.compile(
-    r'viator\.com/[^\s"\']*/(?:d\d+-)?([A-Z][A-Z0-9]+)\?',
-    re.IGNORECASE,
-)
-VIATOR_LINK_RE = re.compile(
-    r'(<a\s[^>]*href="https?://[^\"]*viator\.com[^\"]*"[^>]*>)',
-    re.IGNORECASE,
-)
-
-
-# ── Tiny YAML loader (handles the limited syntax our sites.yaml uses) ───────
-# We don't want to require PyYAML at runtime. The sites.yaml we generate is
-# pure YAML 1.1 — keys, scalars, lists, nested maps. This parser handles that.
-
-def _parse_yaml_minimal(text: str) -> dict:
-    """
-    Minimal YAML loader for sites.yaml. Supports:
-      - key: value
-      - key:\n  nested-key: value
-      - key:\n    - item\n    - item
-      - comments starting with '#'
-    Raises ValueError on unsupported constructs so the caller can fall back
-    to PyYAML if installed.
-    """
-    lines = []
-    for raw in text.splitlines():
-        # strip trailing comments but not '#' inside quoted strings
-        # (our file has no quoted scalars so a simple split is safe)
-        hash_pos = raw.find("#")
-        if hash_pos >= 0 and not raw[:hash_pos].rstrip().endswith('"'):
-            raw = raw[:hash_pos]
-        stripped = raw.rstrip()
-        if not stripped.strip():
-            continue
-        lines.append(stripped)
-
-    root: dict = {}
-    # stack of (indent, container)
-    stack: list[tuple[int, Any]] = [(-1, root)]
-
-    def peek_next_is_list(idx: int) -> bool:
-        """True if the next non-empty line starts with '- ' at greater indent."""
-        for nxt in lines[idx + 1:]:
-            nxt_stripped = nxt.strip()
-            if not nxt_stripped:
-                continue
-            nxt_indent = len(nxt) - len(nxt.lstrip(" "))
-            return nxt_stripped.startswith("- ") and nxt_indent > indent
-        return False
-
-    for idx, line in enumerate(lines):
-        indent = len(line) - len(line.lstrip(" "))
-        content = line.strip()
-        # pop containers that don't contain this line
-        while stack and stack[-1][0] >= indent:
-            stack.pop()
-        parent_indent, parent = stack[-1]
-
-        if content.startswith("- "):
-            # list item
-            item_val = content[2:].strip()
-            if not isinstance(parent, list):
-                raise ValueError(f"unexpected list item: {line!r}")
-            if ":" in item_val and not item_val.startswith('"'):
-                # inline mapping start: "- key: value"
-                key, _, val = item_val.partition(":")
-                val = val.strip()
-                new_map: dict = {}
-                new_map[key.strip()] = _coerce(val)
-                parent.append(new_map)
-                # push map at indent+2 so nested keys hang off it
-                stack.append((indent + 2, new_map))
-            else:
-                parent.append(_coerce(item_val))
-        elif ":" in content:
-            key, _, val = content.partition(":")
-            key = key.strip()
-            val = val.strip()
-            if val == "":
-                if not isinstance(parent, dict):
-                    raise ValueError(f"unexpected map under non-dict: {line!r}")
-                # Decide map vs list by peeking ahead
-                if peek_next_is_list(idx):
-                    new_container: list = []
-                    parent[key] = new_container
-                    stack.append((indent, new_container))
-                else:
-                    new_container = {}
-                    parent[key] = new_container
-                    stack.append((indent, new_container))
-            else:
-                if not isinstance(parent, dict):
-                    raise ValueError(f"unexpected map key: {line!r}")
-                parent[key] = _coerce(val)
-
-    return root
-
-
-def _coerce(val: str) -> Any:
-    """Coerce a scalar string to int/float/bool/str."""
-    if val == "" or val is None:
-        return val
-    if val.lower() in ("true", "yes"):
-        return True
-    if val.lower() in ("false", "no"):
-        return False
-    if val.startswith("[") and val.endswith("]"):
-        inner = val[1:-1].strip()
-        if not inner:
-            return []
-        return [_coerce(v.strip()) for v in inner.split(",")]
-    try:
-        return int(val)
-    except ValueError:
-        pass
-    try:
-        return float(val)
-    except ValueError:
-        pass
-    return val
-
-
-def load_sites_yaml(path: Path) -> dict:
-    """Load sites.yaml. Tries PyYAML first, falls back to the minimal parser."""
-    text = path.read_text()
-    try:
-        import yaml  # type: ignore[import-not-found]
-        return yaml.safe_load(text) or {}
-    except ImportError:
-        return _parse_yaml_minimal(text)
-
-
-# ── Site registry ───────────────────────────────────────────────────────────
-
-@dataclass
-class SiteConfig:
-    slug: str
-    path: Path
-    domain: str = ""
-    fleet: str = ""
-    images_dir: Path | None = None
-    languages: list[str] = field(default_factory=list)
-    paused: bool = False
-
-
-def load_site_registry(
-    yaml_path: Path = DEFAULT_SITES_YAML,
-    site_filter: str | None = None,
-    fleet_filter: str | None = None,
-) -> dict[str, SiteConfig]:
-    """
-    Load sites.yaml and return a {slug: SiteConfig} dict. Optionally filter
-    by site slug or fleet name. Filter is an exact match (no glob).
-    """
-    if not yaml_path.exists():
-        raise FileNotFoundError(
-            f"sites.yaml not found at {yaml_path}. "
-            "Create it (see ~/.hermes/affiliate-crons/config/sites.yaml) "
-            "or pass --sites-yaml to point elsewhere."
-        )
-    raw = load_sites_yaml(yaml_path)
-    sites_raw = raw.get("sites", {}) or {}
-    out: dict[str, SiteConfig] = {}
-    for slug, cfg in sites_raw.items():
-        if site_filter and slug != site_filter:
-            continue
-        if fleet_filter and cfg.get("fleet") != fleet_filter:
-            continue
-        if cfg.get("paused"):
-            continue
-        path = Path(os.path.expanduser(cfg["path"]))
-        images_dir = cfg.get("images_dir")
-        out[slug] = SiteConfig(
-            slug=slug,
-            path=path,
-            domain=cfg.get("domain", ""),
-            fleet=cfg.get("fleet", ""),
-            images_dir=Path(os.path.expanduser(images_dir)) if images_dir else (path / "images"),
-            languages=list(cfg.get("languages", []) or []),
-            paused=bool(cfg.get("paused", False)),
-        )
-    return out
-
-
-# ── URL → site mapping ──────────────────────────────────────────────────────
-
-def url_to_site(url: str, sites: dict[str, SiteConfig]) -> str | None:
-    """Match a URL to a site slug by hostname or by site path prefix."""
-    parsed = urlparse(url)
-    host = parsed.netloc.lower().lstrip("www.")
-
-    # 1) Match by domain
-    for slug, cfg in sites.items():
-        if cfg.domain and cfg.domain.lower().lstrip("www.") == host:
-            return slug
-
-    # 2) Fallback: path-based heuristic. Local files have file:// or absolute paths.
-    #    "https://porto-wine-tours.com/foo" → slug whose domain matches, else None.
-    #    For file:// URLs the path may be the actual site root.
-    for slug, cfg in sites.items():
-        if cfg.path and url.startswith(str(cfg.path)):
-            return slug
-        if cfg.path and cfg.path.name in url:
-            return slug
-
-    # 3) Hostname fuzzy match (e.g. "porto-wine-tours.com" → "porto-sommelier")
-    for slug, cfg in sites.items():
-        if cfg.domain:
-            d = cfg.domain.lower().lstrip("www.")
-            if d.split(".")[0] in host:
-                return slug
-
-    return None
-
-
-# ── URL file loader ─────────────────────────────────────────────────────────
-
-def load_urls(path: Path) -> list[str]:
-    """Read URLs from a file (one per line, '#' = comment)."""
-    urls: list[str] = []
-    for line in path.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        urls.append(line)
-    return urls
-
-
-# ── Audit runner ────────────────────────────────────────────────────────────
-
-def run_audit(
-    urls: list[str],
-    audit_dir: Path,
-    output_json: Path | None = None,
-    viewport: str = "1280x720",
-    concurrency: int = 3,
-) -> list[dict]:
-    """
-    Run the image placement audit CLI against a list of URLs.
-    Returns the parsed JSON report (a list of page-result dicts, or a single
-    dict if only one URL).
-    """
-    # Import the audit tool as a package so its relative imports work.
-    # The audit tool's `src/` directory is the package (it has __init__.py).
-    audit_src = audit_dir / "src"
-    if not audit_src.exists():
-        raise FileNotFoundError(
-            f"Audit tool not found at {audit_dir}. "
-            "Pass --audit-dir to override."
-        )
-    audit_parent = str(audit_dir)
-    if audit_parent not in sys.path:
-        sys.path.insert(0, audit_parent)
-    from src.cli import audit_batch  # type: ignore[import-not-found]
-
-    results = audit_batch(urls, viewport=viewport, concurrency=concurrency)
-    if output_json:
-        output_json.parent.mkdir(parents=True, exist_ok=True)
-        payload = results[0] if len(results) == 1 else results
-        output_json.write_text(json.dumps(payload, indent=2, default=str) + "\n")
-    return results
-
-
-def has_r12_violation(audit_result: dict) -> bool:
-    """True if the page result has at least one R12 violation."""
-    for v in audit_result.get("violations", []) or []:
-        if v.get("rule_id") == R12_RULE_ID:
-            return True
-    return False
-
-
-# ── Local image lookup ──────────────────────────────────────────────────────
-
-def find_local_product_image(
-    html: str,
-    images_dir: Path,
-) -> str | None:
-    """
-    For an R12-violating page, find the primary product code mentioned in
-    the HTML and check whether its image exists locally. Returns the
-    image's filename (e.g. "ABC123.jpg") if found, else None.
-    """
-    codes = extract_product_codes(html)
-    if not codes:
-        return None
-    images_dir = Path(images_dir)
-    if not images_dir.is_dir():
-        return None
-    for code in codes:
-        for ext in (".jpg", ".jpeg", ".png", ".webp"):
-            candidate = images_dir / f"{code}{ext}"
-            if candidate.exists():
-                return candidate.name
-    return None
-
-
-def extract_product_codes(html: str) -> list[str]:
-    """Extract Viator product codes from a page's HTML (deduped, order preserved)."""
-    seen: set[str] = set()
-    out: list[str] = []
-    for m in VIATOR_CODE_RE.finditer(html):
-        code = m.group(1).upper()
-        if code not in seen:
-            seen.add(code)
-            out.append(code)
-    return out
-
-
-def extract_product_codes_for_queue(html: str, primary_image_filename: str | None) -> list[str]:
-    """
-    Return the product codes that need to be queued for Viator fetch.
-    If primary_image_filename is set, that means injection succeeded —
-    skip those codes (they're already covered). Return only the rest.
-    """
-    all_codes = extract_product_codes(html)
-    if primary_image_filename:
-        # crude: strip extension from filename and compare uppercase
-        covered = primary_image_filename.rsplit(".", 1)[0].upper()
-        return [c for c in all_codes if c != covered]
-    return all_codes
-
-
-# ── Image injection ─────────────────────────────────────────────────────────
-
-DEFAULT_INJECT_IMG_TEMPLATE = (
-    '<img src="/images/{filename}" alt="{alt}" '
-    'width="800" height="533" loading="lazy" '
-    'class="injected-product-image">'
-)
-
-
-def build_img_tag(filename: str, alt: str = "Product image") -> str:
-    """Build a self-contained <img> tag. Public so other tools can import it."""
-    safe_alt = (
-        alt.replace("&", "&amp;")
-           .replace('"', "&quot;")
-           .replace("<", "&lt;")
-           .replace(">", "&gt;")
-    )
-    safe_alt = safe_alt[:125]  # accessibility cap
-    return DEFAULT_INJECT_IMG_TEMPLATE.format(filename=filename, alt=safe_alt)
-
-
-def inject_image_into_html(html: str, image_filename: str, alt: str = "Product image") -> str:
-    """
-    Insert an <img> tag before the first Viator <a> link on the page. If no
-    Viator link exists, insert after the first <h1> as a last resort.
-
-    Idempotent: if an injected-product-image already exists, skip.
-    Atomic at the caller level (we only return modified text).
-    """
-    if 'class="injected-product-image"' in html or "injected-product-image" in html:
-        return html
-
-    img_tag = build_img_tag(image_filename, alt)
-
-    # Prefer: right before first Viator link
-    match = VIATOR_LINK_RE.search(html)
-    if match:
-        return html[: match.start()] + img_tag + match.group(0) + html[match.end():]
-
-    # Fallback: right after first <h1> closing tag
-    h1_close = re.search(r"</h1\s*>", html, re.IGNORECASE)
-    if h1_close:
-        idx = h1_close.end()
-        return html[:idx] + "\n" + img_tag + html[idx:]
-
-    # Last resort: after <body>
-    body_match = re.search(r"<body[^>]*>", html, re.IGNORECASE)
-    if body_match:
-        idx = body_match.end()
-        return html[:idx] + "\n" + img_tag + html[idx:]
-
-    # No anchors to inject after — prepend
-    return img_tag + "\n" + html
-
-
-def inject_image_into_file(filepath: Path, image_filename: str, dry_run: bool = False) -> bool:
-    """Read a file, inject an <img>, write atomically. Returns True if changed."""
-    original = filepath.read_text()
-    modified = inject_image_into_html(original, image_filename)
-    if modified == original:
-        return False
-    if dry_run:
-        return True
-    tmp = filepath.with_suffix(filepath.suffix + ".tmp")
-    tmp.write_text(modified)
-    os.replace(tmp, filepath)
-    return True
-
-
-# ── Queue I/O ───────────────────────────────────────────────────────────────
-
-def append_to_queue(queue_file: Path, codes: list[str]) -> int:
-    """
-    Append product codes to a queue file (one per line). De-dupes against
-    existing lines so the queue stays clean across re-runs. Returns the
-    number of NEW codes appended.
-    """
-    queue_file.parent.mkdir(parents=True, exist_ok=True)
-    existing: set[str] = set()
-    if queue_file.exists():
-        existing = {
-            ln.strip().upper()
-            for ln in queue_file.read_text().splitlines()
-            if ln.strip() and not ln.startswith("#")
-        }
-    new = []
-    for c in codes:
-        cu = c.upper()
-        if cu not in existing:
-            existing.add(cu)
-            new.append(cu)
-    if not new:
-        return 0
-    with queue_file.open("a") as f:
-        for c in new:
-            f.write(c + "\n")
-    return len(new)
+# Kept for backward-compat with any external caller that imported the
+# constants from this module directly.
+__all__ = [
+    "SiteConfig",
+    "PageAction",
+    "LoopReport",
+    "R12_RULE_ID",
+    "VIATOR_CODE_RE",
+    "VIATOR_LINK_RE",
+    "DEFAULT_INJECT_IMG_TEMPLATE",
+    "DEFAULT_SITES_YAML",
+    "DEFAULT_AUDIT_DIR",
+    "DEFAULT_LOG_DIR",
+    "DEFAULT_QUEUE_DIR",
+    # functions
+    "load_sites_yaml",
+    "load_site_registry",
+    "url_to_site",
+    "url_to_local_file",
+    "load_urls",
+    "strip_www",
+    "run_audit",
+    "has_r12_violation",
+    "extract_product_codes",
+    "extract_product_codes_for_queue",
+    "find_local_product_image",
+    "build_img_tag",
+    "inject_image_into_html",
+    "inject_image_into_file",
+    "append_to_queue",
+    "process_page",
+    "run",
+    "main",
+]
 
 
 # ── Result aggregation ──────────────────────────────────────────────────────
+
 
 @dataclass
 class PageAction:
@@ -508,6 +151,9 @@ class LoopReport:
     pages_manual_curation: list[dict]
     queue_files_written: list[str]
     pages: list[PageAction] = field(default_factory=list)
+
+
+# ── Per-page decisioning ────────────────────────────────────────────────────
 
 
 def process_page(
@@ -607,30 +253,8 @@ def process_page(
     return base, queue_files
 
 
-def url_to_local_file(url: str, cfg: SiteConfig) -> Path | None:
-    """
-    Translate a public URL into a local file path under cfg.path. Handles:
-      - file:///abs/path
-      - file://localhost/abs/path
-      - https://domain.tld/...      → <cfg.path>/...
-      - already absolute path       → as-is
-    """
-    parsed = urlparse(url)
-    if parsed.scheme == "file":
-        p = parsed.path
-        return Path(p)
-    if parsed.scheme in ("", "file"):
-        return Path(url)
-    if parsed.scheme in ("http", "https"):
-        if not cfg.path:
-            return None
-        # strip leading slash so we don't end up at site root + abs-path
-        rel = parsed.path.lstrip("/")
-        return cfg.path / rel
-    return None
-
-
 # ── Main pipeline ───────────────────────────────────────────────────────────
+
 
 def run(
     urls: list[str],
@@ -717,6 +341,7 @@ def run(
 
 
 # ── CLI ─────────────────────────────────────────────────────────────────────
+
 
 def _print_summary(report: LoopReport) -> None:
     print(f"\nAudit-Action Loop — {report.started_at} → {report.finished_at}")

@@ -46,6 +46,11 @@ def detect(html: str, filepath: str, url: str) -> list[Violation]:
                       disclosure_found=False, is_hyperlink=False, rule="missing-disclosure")]
 
     if _disclosure_is_hyperlinked(visible_html, match.start()):
+        # Check if a non-hyperlink disclosure also exists further ahead
+        remaining = before[match.end():]
+        second = _DISCLOSURE_RE.search(remaining)
+        if second and not _disclosure_is_hyperlinked(visible_html, match.end() + second.start()):
+            return []  # plain-text disclosure exists further ahead
         return [_make(visible_html, filepath, url, first_link_pos,
                       disclosure_found=True, is_hyperlink=True, rule="hyperlink-disclosure")]
 

@@ -2028,6 +2028,12 @@ def generate_article(slug, cb, brief, lang="en", engine="deepseek"):
                 # the pre-pipeline state where pages went out without QA.
                 print(f"  IMAGE: injection failed (non-fatal): {_img_err}")
 
+        # Guard: reject empty pages — root cause of all 128 R12 violations.
+        # If the generator produces a 0-byte stub, don't write it to disk.
+        if not html or not html.strip():
+            print(f"  ERROR: Generated empty page for {article_slug} — not writing to disk")
+            return None
+
         with open(out_path, "w") as f:
             f.write(html)
         if not html.strip().startswith("<!") and not html.strip().startswith("<"):

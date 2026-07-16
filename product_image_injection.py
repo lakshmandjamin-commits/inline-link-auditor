@@ -57,6 +57,48 @@ R1_R2_LANDMARKS = ("explore-more", "faq", "verdict", "winner-box")
 # Default fleet site root. Saraswati layout: ~/sites/{slug}/images/{code}.jpg.
 # Hanumanhermes is reached by overriding images_dir at the call site.
 DEFAULT_SITES_ROOT = os.path.expanduser("~/sites")
+_SITES_YAML = os.path.join(
+    os.path.dirname(os.path.dirname(__file__)), "config", "sites.yaml"
+)
+
+
+def _load_sites_config() -> dict:
+    """Load the unified sites.yaml config, with caching.
+    
+    Only caches on successful load. A corrupted file re-raises so the
+    caller gets a clear error rather than silently operating with empty config.
+    """
+    if not hasattr(_load_sites_config, "_cache"):
+        try:
+            with open(_SITES_YAML) as f:
+                import yaml as _yaml
+                config = _yaml.safe_load(f)
+            if not isinstance(config, dict) or "sites" not in config:
+                raise ValueError(f"Invalid sites.yaml: missing 'sites' key")
+            _load_sites_config._cache = config
+        except Exception:
+            import sys
+            print(f"WARNING: Failed to load sites.yaml from {_SITES_YAML}", file=sys.stderr)
+            _load_sites_config._cache = {"sites": {}}
+    return _load_sites_config._cache
+
+
+def _site_images_dir(slug: str, images_dir: Optional[str] = None) -> str:
+    """Resolve images directory for a site slug.
+
+    Priority: explicit images_dir param → sites.yaml images_dir → sites.yaml path/images
+              → DEFAULT_SITES_ROOT/slug/images.
+    """
+    if images_dir:
+        return images_dir
+    config = _load_sites_config()
+    site_data = config.get("sites", {}).get(slug, {})
+    # Prefer explicit images_dir field from sites.yaml
+    if "images_dir" in site_data:
+        return os.path.expanduser(site_data["images_dir"])
+    if "path" in site_data:
+        return os.path.join(os.path.expanduser(site_data["path"]), "images")
+    return os.path.join(DEFAULT_SITES_ROOT, slug, "images")
 
 
 # ---------------------------------------------------------------------------
@@ -210,15 +252,25 @@ def image_path_for_code(slug: str, code: str,
         return None, None
     if not VIATOR_PRODUCT_CODE_RE.fullmatch(code):
         return None, None
-    img_dir = images_dir or os.path.join(DEFAULT_SITES_ROOT, slug, "images")
+    img_dir = _site_images_dir(slug, images_dir)
     if not os.path.isdir(img_dir):
         return None, None
-    for suffix in ("", "_1", "_2"):
-        filename = f"{code}{suffix}.jpg"
-        full = os.path.join(img_dir, filename)
-        if os.path.isfile(full) and os.path.getsize(full) > 0:
-            url = f"/images/{filename}"
-            return url, full
+
+    # Try the exact code first, then variant fallback.
+    # 424075P18 → try 424075P18.jpg, then strip variant: 424075P1.jpg
+    codes_to_try = [code]
+    variant_match = re.match(r'^(\d{4,7})P(\d{1,4})$', code)
+    if variant_match and variant_match.group(2) != '1':
+        base_code = f"{variant_match.group(1)}P1"
+        codes_to_try.append(base_code)
+
+    for c in codes_to_try:
+        for suffix in ("", "_1", "_2"):
+            filename = f"{c}{suffix}.jpg"
+            full = os.path.join(img_dir, filename)
+            if os.path.isfile(full) and os.path.getsize(full) > 0:
+                url = f"/images/{filename}"
+                return url, full
     return None, None
 
 
@@ -229,7 +281,7 @@ def find_category_image(slug: str, topic: str = "",
     Looks for cat-{topic}.jpg first; falls back to any cat-*.jpg. Returns
     (url_path, filesystem_path) — same contract as image_path_for_code.
     """
-    img_dir = images_dir or os.path.join(DEFAULT_SITES_ROOT, slug, "images")
+    img_dir = _site_images_dir(slug, images_dir)
     if not os.path.isdir(img_dir):
         return None, None
     candidates: List[str] = []
@@ -288,15 +340,28 @@ def find_winner_product(html: str) -> Optional[str]:
     return codes[0] if codes else None
 
 
-def find_primary_product(html: str, brief: Optional[dict]) -> Optional[str]:
+def find_primary_product(html: str, brief: Optional[dict], article_slug: str = "") -> Optional[str]:
     """Pick the primary product for a review page.
 
-    Order: brief's products_to_feature[0] → first data-viator-id on the page.
+    Priority:
+      1. Product code that appears in the page slug AND anywhere in the HTML
+         (e.g., husky-sled-ride-5516800P30 → 5516800P30 found in href/text).
+      2. Brief's products_to_feature[0].
+      3. First data-viator-id on the page.
     """
     brief_codes = extract_product_codes_from_brief(brief or {})
+    page_codes = extract_product_codes_from_html(html)
+
+    # Prefer a code that appears in BOTH the slug AND the HTML (anywhere —
+    # hrefs, text, not just data-viator-id attributes)
+    if article_slug:
+        for m in VIATOR_PRODUCT_CODE_RE.finditer(article_slug):
+            sc = m.group(1)
+            if sc in html:
+                return sc
+
     if brief_codes:
         return brief_codes[0]
-    page_codes = extract_product_codes_from_html(html)
     return page_codes[0] if page_codes else None
 
 
@@ -331,9 +396,8 @@ def build_img_tag(url_path: str, alt: str, *, css_class: str = "injected-product
 
 def _has_hero_image(html: str) -> bool:
     """Has this page already received a hero? Used to avoid double-injection."""
-    # We consider a hero "present" if there's an <img> with hero class anywhere,
-    # or any <img> inside <header> / <main> before the first product card.
-    if re.search(r'<img[^>]*class=["\'][^"\']*\bhero\b', html, re.IGNORECASE):
+    # Match: hero class, injected-product-image, injected-winner-image, category-hero
+    if re.search(r'<img[^>]*class=["\'][^"\']*\b(?:hero|injected-product-image|injected-winner-image|category-hero)', html, re.IGNORECASE):
         return True
     return False
 
@@ -634,7 +698,7 @@ def inject_product_images(html: str, slug: str, brief: Optional[dict] = None,
     page_type = classify_page_type(html, brief, slug, article_slug)
 
     if page_type == "review":
-        code = find_primary_product(html, brief)
+        code = find_primary_product(html, brief, article_slug)
         if not code:
             return html, InjectionResult(
                 page_type=page_type,

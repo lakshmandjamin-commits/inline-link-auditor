@@ -36,10 +36,22 @@ _VAGUE_TOKENS = [
     "learn", "read", "find", "out", "more",
     "check", "it", "tap", "see",
 ]
-_VAGUE_RE = re.compile(
+_VAGUE_TOKEN_RE = re.compile(
     r"\b(" + "|".join(re.escape(t) for t in _VAGUE_TOKENS) + r")\b",
     re.IGNORECASE,
 )
+
+
+def _is_entirely_generic(anchor: str) -> bool:
+    """True when the anchor consists ONLY of vague tokens + whitespace/punctuation.
+    
+    "Book Bali Sunrise Tour" → keeps "Bali Sunrise Tour" → specific → False.
+    "this tour" → keeps "tour" → specific → False (catches proper-noun check).
+    "click here" → empty after strip → generic → True.
+    """
+    cleaned = _VAGUE_TOKEN_RE.sub("", anchor)
+    cleaned = re.sub(r"[^\w]", "", cleaned)  # strip punctuation
+    return cleaned.strip() == ""
 # Proper noun: capitalised word, > 2 chars (matches "Porto", "Marina"; rejects "NY").
 _PROPER_NOUN_RE = re.compile(r"\b[A-Z][a-zA-Z]{2,}\b")
 
@@ -63,7 +75,7 @@ def detect(
         if not anchor:
             violations.append(_make(link, html, filepath, page_url, "anchor-empty"))
             continue
-        if _VAGUE_RE.search(anchor):
+        if _VAGUE_TOKEN_RE.search(anchor):
             violations.append(_make(link, html, filepath, page_url, "vague-phrase"))
             continue
         if len(anchor) < 8:
