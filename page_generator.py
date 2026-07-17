@@ -1855,6 +1855,28 @@ def generate_article(slug, cb, brief, lang="en", engine="deepseek"):
         # FIX #5: ANTI-WORD AUTO-FIX
         html = strip_antiwords_in_generated(html)
 
+        # FIX: HTML ENTITY ESCAPING — raw & in href attributes breaks valid HTML
+        # Bug: Claude outputs ?pid=123&mcid=456 instead of ?pid=123&amp;mcid=456
+        # Fix: convert bare & in href values to &amp;, skip already-escaped entities
+        def _escape_href_ampersands(html):
+            def _fix_ampersand(m):
+                full = m.group(0)
+                quote_char = m.group(1) or '"'
+                url = m.group(2)
+                if url is None: return full
+                # Only fix if there are bare & chars not already part of &amp; &lt; &gt; &quot; &nbsp; &#...;
+                if re.search(r'&(?!amp;|lt;|gt;|quot;|nbsp;|#)', url):
+                    fixed_url = re.sub(r'&(?!amp;|lt;|gt;|quot;|nbsp;|#)', '&amp;', url)
+                    return f'href={quote_char}{fixed_url}{quote_char}'
+                return full
+            return re.sub(
+                r'''href=([\"\'])(.*?)\1''',
+                _fix_ampersand,
+                html,
+                flags=re.IGNORECASE
+            )
+        html = _escape_href_ampersands(html)
+
         # JSON-LD REPAIR (control character cleanup)
         import json as json_mod
         ld_pattern = re.compile(
@@ -1897,6 +1919,10 @@ def generate_article(slug, cb, brief, lang="en", engine="deepseek"):
         FABRICATED_PATTERNS = [
             r'^12345P\\d*$', r'^5678P\\d*$', r'^XXXX+$', r'^abc$', r'^xyz$',
             r'^g8$', r'^ttd$', r'FOODWINE',
+            # July 2026: Claude hallucinates pNNNN, tNNNNNN placeholder-like codes
+            r'^p\d{2,}$', r'^t\d{2,}$',
+            # July 2026: lorem-ipsum-style tour slugs leak into product codes
+            r'jomblang-pindul-cave-tour', r'menoreh-kotagede', r'borobudur-prambanan',
         ]
         product_codes = re.findall(r'data-viator-id="([^"]+)"', html)
         fabricated = [c for c in product_codes for p in FABRICATED_PATTERNS if re.match(p, c)]
