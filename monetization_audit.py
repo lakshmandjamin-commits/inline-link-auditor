@@ -156,6 +156,17 @@ def audit(site_dir: str) -> dict:
             if has_inline is False:
                 failures.append('No inline Viator link in first 400 words')
 
+        # Gate #4: stub pages — non-editorial, non-utility pages with 0 links
+        # &lt;1000 bytes = almost certainly a broken pipeline artifact
+        if not editorial and not is_homepage and viator_count == 0:
+            basename = os.path.basename(html_file).lower()
+            stub_stems = {'privacy', 'contact', '404', 'terms', 'about', 'impressum'}
+            is_utility = any(s in basename for s in stub_stems)
+            if not is_utility:
+                file_size = os.path.getsize(html_file)
+                if file_size < 1000 or '<main' not in html:
+                    failures.append(f'Stub page: {file_size} bytes, no main content')
+
         if failures:
             page_result['failures'] = failures
             results['failures'].append({'page': rel, 'issues': failures})
