@@ -38,14 +38,8 @@ def get_sites(target="all"):
     return sites
 
 def _count_product_links(html):
-    """Count Viator product links — scoped to href attributes only.
-    
-    v2.1: Excludes data-goatcounter-click attributes that also contain
-    product codes. Double-counting inflated links by 2x (Jul 2026 subagent audit).
-    """
-    # Extract all Viator hrefs first, then count product codes within them
-    hrefs = re.findall(r'href=["\'](https?://[^"\']*viator\.com[^"\']*/d\d+-[A-Z0-9]+)', html, re.IGNORECASE)
-    return len(hrefs)
+    """Count Viator product links using robust regex (v2.0)."""
+    return len(PRODUCT_CODE_RE.findall(html))
 
 def _count_words(html):
     """Count words excluding HTML tags (v2.0)."""
