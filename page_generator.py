@@ -706,7 +706,7 @@ def rebuild_head(html, domain, slug, lang="en"):
     return html
 
 
-def call_claude(system_prompt, user_prompt, max_turns=6, lang="en", timeout=180):
+def call_claude(system_prompt, user_prompt, max_turns=6, lang="en", timeout=300):
     """Call Claude CLI with system+user prompt. Fall back to DeepSeek on failure."""
     import subprocess, tempfile
     
