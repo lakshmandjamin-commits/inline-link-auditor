@@ -443,33 +443,59 @@ def main():
 
     report(f"\n✅ Generated {len(generated)} pages, {len(failed)} failed")
 
-    # ── Phase 4.2: QA Gate ──
+    # ── Phase 4.2: QA Gate (self-healing — retries with feedback) ──
     report("\n## Phase 4.2 — QA Gate")
     qa_failures = []
-    for slug in generated:
-        rc, out, err = run_script("qa_pipeline.py", [site_slug, slug], env, timeout=120)
-        # qa_pipeline exits 0 for PASS/SKIP, non-zero for error
-        # Parse output for the verdict: "APPROVED" = pass, "REGENERATE" = fail, "DISCARD" = fail
-        if rc != 0:
-            report(f"  ❌ QA ERROR for {slug} (exit {rc})")
+    MAX_QA_RETRIES = 3
+
+    for slug in list(generated):  # iterate copy — generated shrinks on final failure
+        passed = False
+        for attempt in range(1, MAX_QA_RETRIES + 1):
+            rc, out, err = run_script("qa_pipeline.py", [site_slug, slug], env, timeout=120)
+
+            if rc != 0:
+                report(f"  ⚠️ QA attempt {attempt}/{MAX_QA_RETRIES} for {slug}: error (exit {rc})")
+            elif "APPROVED" in out:
+                report(f"  ✅ QA PASS {slug} (attempt {attempt})")
+                passed = True
+                break
+            elif "REGENERATE" in out or "DISCARD" in out:
+                if attempt < MAX_QA_RETRIES:
+                    report(f"  🔄 Regenerating {slug} with QA feedback (attempt {attempt})")
+                    # Look up brief for this slug from candidate_briefs
+                    brief_for_slug = next((b for b in candidate_briefs if b.get("slug") == slug), None)
+                    if brief_for_slug:
+                        brief_idx = briefs.index(brief_for_slug)
+                    else:
+                        brief_idx = 0
+                    rc2, out2, err2 = run_script("page_generator.py",
+                                                  [site_slug, str(brief_idx), "--briefs", filtered_path,
+                                                   "--feedback", out[:1000]],
+                                                  env, timeout=300)
+                    if rc2 != 0:
+                        report(f"  ❌ Regeneration failed for {slug} (exit {rc2})")
+                        if err2:
+                            report(f"  ```\n{err2[:400]}\n```")
+                        # Fall through to next attempt
+                    else:
+                        # Check if new file produced
+                        gen_file = GENERATED_DIR / site_slug / f"{slug}.html"
+                        if gen_file.exists() and gen_file.stat().st_size > 500:
+                            continue  # try QA again
+            else:
+                # SKIP — article not found, already reviewed, or other non-error
+                report(f"  ⏭️ QA SKIP {slug} (already reviewed)")
+                passed = True
+                break
+
+        if not passed:
+            report(f"  ❌ QA BLOCKED {slug} after {MAX_QA_RETRIES} attempts — discarded")
             qa_failures.append(slug)
-        elif "APPROVED" in out:
-            report(f"  ✅ QA PASS {slug}")
-        elif "REGENERATE" in out or "DISCARD" in out:
-            report(f"  ❌ QA BLOCKED {slug} — verdict: regenerate/discard")
-            qa_failures.append(slug)
-        else:
-            # SKIP — article not found, already reviewed, or other non-error
-            report(f"  ⏭️ QA SKIP {slug} (already reviewed or not found)")
-            # Don't block — if qa_pipeline returned 0 and skipped, it means
-            # the page was already approved or doesn't need QA
 
     if qa_failures:
         report(f"\n❌ QA gate blocked {len(qa_failures)} pages: {', '.join(qa_failures)}")
-        report("These pages will NOT be deployed. Fix the generator or briefs before the next drip.")
-        # Remove failed pages from generated list
+        report("These pages will NOT be deployed. Check generator before next drip.")
         generated = [s for s in generated if s not in qa_failures]
-        # Delete the failed files
         for slug in qa_failures:
             gen_file = GENERATED_DIR / site_slug / f"{slug}.html"
             if gen_file.exists():
