@@ -714,10 +714,13 @@ def call_claude(system_prompt, user_prompt, max_turns=6, lang="en", timeout=180)
     claude_bin = os.path.expanduser("~/.hermes/node/bin/claude")
     
     try:
+        env = dict(os.environ)
+        api_key = os.environ.get("ANTHROPIC_API_KEY")
+        if api_key: env["ANTHROPIC_API_KEY"] = api_key
         result = subprocess.run(
             [claude_bin, "-p", "--model", "claude-sonnet-5", "--max-turns", str(max_turns), full_prompt],
             capture_output=True, text=True, timeout=timeout,
-            env={**os.environ, "ANTHROPIC_API_KEY": os.environ.get("ANTHROPIC_API_KEY", "")}
+            env=env
         )
         if result.returncode != 0:
             print(f"  WARNING: Claude CLI returned code {result.returncode}, falling back to DeepSeek")
