@@ -185,6 +185,16 @@ SLUG_ALIASES = {
     "porto-sommelier": "porto-wine-tours",
 }
 
+# Valid Viator destination codes per site — used for product schema + cross-destination validation
+VALID_DEST_CODES = {
+    "porto-sommelier":       {"26879", "538", "529", "562", "782", "5404", "5343", "537", "557", "792"},
+    "tenerife-outdoor-guide": {"5404", "530", "507", "553", "522", "552", "551", "739", "523", "519", "529", "506", "508", "51000", "539", "541", "546", "562", "567", "740"},
+    "lapland-adventure-guide": {"22130", "904", "903", "933", "906", "32182", "937", "912", "43039", "4377", "4392", "44033", "44044", "46120", "5122", "5227", "5440", "9225", "923"},
+    "san-juan-excursions":     {"903", "904", "909", "902", "960", "972", "889", "442", "4341", "4415", "712", "915", "920", "9406", "971", "973"},
+    "yogyakarta-temple-tours": {"22560", "4540", "4457", "4200", "4431", "4399", "24625", "34553", "3433", "34523", "34709", "3528", "3722", "4106", "4116", "41448", "4297", "4343", "4344", "4346", "4417", "4437", "4454", "4456", "4501", "5071"},
+    "madeira-trail-guide":          {"5392", "22388", "50841"},
+}
+
 
 def load_content_bank(slug):
     resolved = SLUG_ALIASES.get(slug, slug)
@@ -292,16 +302,33 @@ def fill_narrative_variables(structure, brief, cb):
         h = re.sub(r'^\s*(?:and|vs|—)\s+', '', h)
         h = re.sub(r'\s+(?:and|vs|—)\s*$', '', h)
         h = re.sub(r'\s{2,}', ' ', h)
-        # Product placeholders
+        # Product placeholders — inject title, rating, reviews, duration
         for i, pid in enumerate(brief.get("products_to_feature", [])[:3]):
             p = product_map.get(pid, {})
             h = h.replace(f"{{product_{i+1}}}", p.get("title", f"Product {i+1}"))
+            h = h.replace(f"{{product_{i+1}_rating}}", str(p.get("rating", "N/A")))
+            h = h.replace(f"{{product_{i+1}_reviews}}", str(p.get("reviews", "N/A")))
+            h = h.replace(f"{{product_{i+1}_duration}}", str(p.get("duration", "N/A")))
         # {{double_brace}} narrative vars from brief
         for key, val in narrative_vars.items():
             h = h.replace("{{" + key + "}}", str(val))
         # Fallback: replace any remaining {{...}} with generic fallback
         h = re.sub(r"\{\{(\w+)\}\}", lambda m: narrative_vars.get(m.group(1), f"[[{m.group(1)}]]"), h)
         filled.append(h)
+    # Add PRODUCT DATA block with real stats — prevents "Check current rating" placeholders
+    product_data_lines = ["\n\nPRODUCT DATA (use these exact stats in your prose):"]
+    for i, pid in enumerate(brief.get("products_to_feature", [])[:3]):
+        p = product_map.get(pid, {})
+        title = p.get("title", pid)
+        rating = p.get("rating")
+        reviews = p.get("reviews")
+        duration = p.get("duration")
+        if rating and reviews:
+            product_data_lines.append(f"  • {title}: {rating}★, {reviews} reviews, {duration}")
+        elif title:
+            product_data_lines.append(f"  • {title}: {duration} (rating unavailable — omit citation)")
+    if len(product_data_lines) > 1:
+        filled.append("\n".join(product_data_lines))
     return filled
 
 
@@ -408,6 +435,8 @@ IMPORTANT — ACCESSIBILITY: Include a skip-link (already shown below). All inte
       <h1>ARTICLE_TITLE_WITH_PRIMARY_KEYWORD_AND_DESTINATION</h1>
       <p class="byline">By {persona}, {bio_short}</p>
     </header>
+    <!-- FTC-required: affiliate disclosure BEFORE first monetized link -->
+    <p class="affiliate-disclosure">{lc["affiliate_disclosure"].format(pid=pid)} <a href="/about">Learn more →</a></p>
     <main>
       <!-- H2 sections here -->
     </main>
@@ -418,7 +447,6 @@ IMPORTANT — ACCESSIBILITY: Include a skip-link (already shown below). All inte
     </section>
     <footer>
       <p>SIGN_OFF_LINE</p>
-      <p class="affiliate-disclosure">{lc["affiliate_disclosure"].format(pid=pid)} <a href="/about">Learn more →</a></p>
     </footer>
   </article>
   <script type="application/ld+json">
@@ -450,14 +478,14 @@ Viator product cards MUST use this format — note the PID/MCID params are REQUI
   <div class="product-card" data-viator-id="{{PRODUCT_ID}}">
     <h3>{{PRODUCT_NAME}}</h3>
     <p class="product-blurb">{{YOUR_HONEST_RECOMMENDATION_WITH_PRO_AND_CON}}</p>
-    <a href="{{PRODUCT_URL}}?pid={pid}&mcid={mcid}&medium=link" class="cta-button" rel="sponsored">{lc["cta_text"]}</a>
+    <a href="{{PRODUCT_URL}}?pid={pid}&mcid={mcid}&medium=link" class="cta-button" rel="sponsored noopener noreferrer" target="_blank">{lc["cta_text"]}</a>
   </div>
 
-Inline links use: <a href="{{PRODUCT_URL}}?pid={pid}&mcid={mcid}&medium=link" rel="sponsored">descriptive anchor text</a>
+Inline links use: <a href="{{PRODUCT_URL}}?pid={pid}&mcid={mcid}&medium=link" rel="sponsored noopener noreferrer" target="_blank">descriptive anchor text</a>
 External authority links are REQUIRED: link to official sources when referencing trail conditions, weather, or park information.
 
 INLINE AFFILIATE LINKS — at least 2 Viator links MUST be embedded naturally in the body text:
-  <a href="{{PRODUCT_URL}}?pid={pid}&mcid={mcid}&medium=link" rel="sponsored">descriptive anchor text</a>
+  <a href="{{PRODUCT_URL}}?pid={pid}&mcid={mcid}&medium=link" rel="sponsored noopener noreferrer" target="_blank">descriptive anchor text</a>
 These go INSIDE paragraph text, not just in product cards. Weave them into the narrative naturally.
 
 CRITICAL RULES:
@@ -488,7 +516,7 @@ You will lose quality points for omitting authority citations.
 16. NO EM DASHES: Never use em dashes (—) in any text: headings, body copy, bylines, or anywhere. Use commas, periods, or colons instead. Em dashes are an AI tell and violate editorial standards."
 17. PRODUCT COUNT: In trust badges, use {{product_count}} as a placeholder — we fill in the actual count from rendered cards automatically.
 18. GEO OPTIMIZATION: (a) ANSWER-FIRST — every H2 section must open with a direct, citable answer (40-60 words) before expanding. AI systems extract these as citation snippets. (b) CLAIM-EVIDENCE — back factual claims with specific sources: "Average tour group size is 8-12 people (official park guidelines, 2025)" not "most tours keep groups small." (c) ENTITY-RICH — name specific organizations, locations, and frameworks: "ICNF regulates Madeira's levada network" not "the government manages the trails."
-    Format: <a href="{{PRODUCT_URL}}?pid={pid}&mcid={mcid}&medium=link" rel="sponsored">descriptive anchor text</a>""".replace('{{DOMAIN}}', domain)
+    Format: <a href="{{PRODUCT_URL}}?pid={pid}&mcid={mcid}&medium=link" rel="sponsored noopener noreferrer" target="_blank">descriptive anchor text</a>""".replace('{{DOMAIN}}', domain)
 
 
 def build_user_prompt(cb, brief, lang="en"):
@@ -973,7 +1001,6 @@ def repair_structure(html, slug, lang="en", authority_sources=None):
         footer_html = f'''    <footer class="site-footer">
       <div class="footer-content">
         <p class="copyright">&copy; {year} {domain}. All rights reserved.</p>
-        <p class="disclosure">We earn a commission when you book through our links on Viator, at no extra cost to you.</p>
       </div>
     </footer>'''
         body_close = html.rfind('</body>')
@@ -1751,14 +1778,6 @@ def generate_article(slug, cb, brief, lang="en", engine="deepseek"):
 
             # FIX #2a: VIATOR DESTINATION CODE VALIDATION
             # Strip Viator links with destination codes not matching this site
-            VALID_DEST_CODES = {
-                "porto-sommelier":       {"26879", "538", "529", "562", "782", "5404", "5343", "537", "557", "792"},
-                "tenerife-outdoor-guide": {"5404", "530", "507", "553", "522", "552", "551", "739", "523", "519", "529", "506", "508", "51000", "539", "541", "546", "562", "567", "740"},
-                "lapland-adventure-guide": {"22130", "904", "903", "933", "906", "32182", "937", "912", "43039", "4377", "4392", "44033", "44044", "46120", "5122", "5227", "5440", "9225", "923"},
-                "san-juan-excursions":     {"903", "904", "909", "902", "960", "972", "889", "442", "4341", "4415", "712", "915", "920", "9406", "971", "973"},
-                "yogyakarta-temple-tours": {"22560", "4540", "4457", "4200", "4431", "4399", "24625", "34553", "3433", "34523", "34709", "3528", "3722", "4106", "4116", "41448", "4297", "4343", "4344", "4346", "4417", "4437", "4454", "4456", "4501", "5071"},
-                "madeira-trail-guide":          {"5392", "22388", "50841"},
-            }
             valid = VALID_DEST_CODES.get(slug, set())
             if valid:
                 wrong_dest = []
@@ -2004,6 +2023,39 @@ def generate_article(slug, cb, brief, lang="en", engine="deepseek"):
                         urlopen(Request(full_url, method='HEAD'), timeout=5)
                 except Exception:
                     print(f"  WARNING: Hero image unreachable: {src}")
+
+        # Gate 8: Product schema — generate Product + AggregateRating JSON-LD for all product cards
+        product_cards = re.findall(r'<div class="product-card"[^>]*data-viator-id="([^"]+)"[^>]*>.*?<h3>(.*?)</h3>.*?</div>', html, re.DOTALL)
+        if product_cards and '"@type": "Product"' not in html:
+            # Get default destination ID for this site
+            dom = get_site_domain(slug) or "example.com"
+            valid_dests = VALID_DEST_CODES.get(slug, set())
+            default_dest = next(iter(valid_dests), "default") if valid_dests else "default"
+            product_schemas = []
+            for code, name in product_cards[:3]:
+                name_clean = re.sub(r'<[^>]+>', '', name).strip()
+                product_schemas.append(f'''    {{
+      "@type": "Product",
+      "name": "{name_clean}",
+      "url": "https://www.viator.com/tours/{default_dest}/{code}?pid=P00303273&mcid=42383",
+      "offers": {{
+        "@type": "Offer",
+        "priceCurrency": "USD",
+        "url": "https://www.viator.com/tours/{default_dest}/{code}?pid=P00303273&mcid=42383"
+      }}
+    }}''')
+            if product_schemas:
+                schemas_joined = ",\n".join(product_schemas)
+                product_ld = f'''<script type="application/ld+json">
+{{
+  "@context": "https://schema.org",
+  "@graph": [
+{schemas_joined}
+  ]
+}}
+</script>'''
+                html = html.replace('</head>', f'{product_ld}\n</head>', 1)
+                print(f"  REPAIR: Added Product JSON-LD to {len(product_cards)} cards")
 
         # Opt-in: expose price-adjacent product names to inline-link injection.
         pp_config = cb.get("post_processing", {})
