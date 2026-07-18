@@ -179,11 +179,7 @@ LANG_CONFIG = {
     },
 }
 
-SLUG_ALIASES = {
-    "tenerife": "tenerife-outdoor-guide",
-    "madeira-trail-guide": "madeira-hiking",
-    "porto-sommelier": "porto-wine-tours",
-}
+SLUG_ALIASES = {}
 
 # Valid Viator destination codes per site — used for product schema + cross-destination validation
 VALID_DEST_CODES = {
@@ -2199,9 +2195,10 @@ def generate_article_with_quality_loop(slug, cb, brief, lang="en", max_retries=3
             r'href="[^"]*/d\d+-YYYYY',           # Y-pattern in URL
             r'href="[^"]*/d12345',               # numeric placeholder URL
             r'href="[^"]*/d67890',               # numeric placeholder URL
-            r'd\d+-\?\?\?',                      # truncated product code (d22388-???)
+                        r'd\d+-\?\?\?',                      # truncated product code (d22388-???)
+            r'd\d+["?&]',                        # bare destination ID, no product code (/d5392?)
             r'\?pid=[^&]+&mcid=',                # affiliate PID on non-affiliate links (category pages)
-            r'"url":\s*"<a\s+href=',             # JSON-LD url field with nested <a> tag
+r'"url":\s*"<a\s+href=',             # JSON-LD url field with nested <a> tag
         ]
         placeholders = []
         for pattern in placeholder_patterns:
