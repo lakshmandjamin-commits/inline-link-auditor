@@ -94,7 +94,7 @@ def fts_search(db, phrase, destination_id):
     for code, title, url, rank in rows:
         title_tokens = set(normalize_tokens(title))
         matched = len(query_set & title_tokens)
-        if matched < 3:
+        if matched < min(3, len(words)):
             continue
         query_coverage = matched / len(query_set)
         title_precision = matched / len(title_tokens) if title_tokens else 0
